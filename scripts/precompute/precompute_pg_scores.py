@@ -19,6 +19,7 @@ This ensures training-time PG context matches eval-time exactly.
 
 Usage:
     python precompute_pg_scores.py
+    torchrun --standalone --nproc_per_node=2 precompute_pg_scores.py --resume
 
 Output:
     {output_path}/pg_scores_hivau_train.json
@@ -45,6 +46,7 @@ import argparse
 from pathlib import Path
 import queue
 import threading
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 
@@ -52,6 +54,7 @@ import cv2
 import PIL.Image
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 
 PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if PROJECT_ROOT not in sys.path:
@@ -263,6 +266,20 @@ def read_video_grids(video_path, image_size, target_fps=4, query_interval=4):
     return grid_images, metadata
 
 
+def save_json_atomic(path, data):
+    """Write JSON atomically so an interrupted run cannot truncate a checkpoint."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Pre-compute PaliGemma anomaly scores for HIVAU training videos")
@@ -317,6 +334,25 @@ def main():
 
     args = parser.parse_args()
 
+    # torchrun sets these variables when launching one worker per GPU. A plain
+    # `python` invocation remains a single-process, single-GPU run.
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    if not torch.cuda.is_available():
+        parser.error("CUDA is required for PaliGemma scoring")
+    if local_rank >= torch.cuda.device_count():
+        parser.error(
+            f"LOCAL_RANK={local_rank}, but only {torch.cuda.device_count()} CUDA device(s) are visible")
+    torch.cuda.set_device(local_rank)
+    device = f"cuda:{local_rank}"
+    if distributed:
+        dist.init_process_group(backend="nccl", init_method="env://")
+
+    def log_info(message):
+        logging.info(f"[rank {rank}] {message}" if distributed else message)
+
     if not args.anno_path:
         parser.error(
             "--anno-path is required; set HIVAU_TRAIN_JSON in paths.local.sh "
@@ -333,37 +369,50 @@ def main():
 
     # PG prompt (must match eval)
     pg_prompt = get_grid_prompt(add_special_tokens=False)
-    logging.info(f"PG prompt: '{pg_prompt}'")
+    log_info(f"PG prompt: '{pg_prompt}'")
 
     # Load annotation
-    logging.info(f"Loading annotation from {args.anno_path}")
+    log_info(f"Loading annotation from {args.anno_path}")
     with open(args.anno_path) as f:
         annotations = json.load(f)
 
     # Extract unique video paths
     unique_videos = sorted(set(d["video"] for d in annotations if "video" in d))
-    logging.info(f"Total annotation entries: {len(annotations)}")
-    logging.info(f"Unique videos: {len(unique_videos)}")
+    log_info(f"Total annotation entries: {len(annotations)}")
+    log_info(f"Unique videos: {len(unique_videos)}")
 
     # Resume support
     existing_results = {}
-    if args.resume and os.path.exists(args.output_path):
-        with open(args.output_path) as f:
-            existing_results = json.load(f)
-        logging.info(f"Resuming: {len(existing_results)} videos already processed")
+    if args.resume:
+        if os.path.exists(args.output_path):
+            with open(args.output_path) as f:
+                existing_results = json.load(f)
+        # Recover worker checkpoints if a prior run stopped before rank 0
+        # merged them into the main output file.
+        for partial_path in Path(args.output_path).parent.glob(
+                Path(args.output_path).name + ".rank-*.json"):
+            with open(partial_path) as f:
+                existing_results.update(json.load(f))
+        log_info(f"Resuming: {len(existing_results)} videos already processed")
         unique_videos = [v for v in unique_videos if v not in existing_results]
-        logging.info(f"Remaining: {len(unique_videos)} videos to process")
+        log_info(f"Remaining: {len(unique_videos)} videos to process")
 
     if not unique_videos:
-        logging.info("All annotation videos are already processed; no inference needed.")
+        if distributed:
+            dist.barrier()
+            if rank == 0:
+                save_json_atomic(args.output_path, existing_results)
+            dist.barrier()
+            dist.destroy_process_group()
+        log_info("All annotation videos are already processed; no inference needed.")
         return
 
     # Load PG model
-    logging.info("Loading PaliGemma model...")
+    log_info(f"Loading PaliGemma model on {device}...")
     scorer = PaliGemmaScorer(
         model_path=args.paligemma_model_path,
         lora_path=args.paligemma_lora_path,
-        device="cuda:0",
+        device=device,
         image_size=args.paligemma_image_size,
         streamforest_weights_path=args.paligemma_streamforest_weights,
         vision_feature_layer=args.paligemma_vision_feature_layer,
@@ -377,6 +426,12 @@ def main():
     QUEUE_MAXSIZE = 24     # Max videos buffered in read queue
 
     results = dict(existing_results)
+    rank_videos = unique_videos[rank::world_size]
+    rank_result_path = f"{args.output_path}.rank-{rank}.json"
+    rank_results = {}
+    if args.resume and os.path.exists(rank_result_path):
+        with open(rank_result_path) as f:
+            rank_results = json.load(f)
     failed = []
     start_time = time.time()
 
@@ -417,10 +472,10 @@ def main():
                 vid_idx = 0
                 max_inflight = NUM_READERS * 3
 
-                while (vid_idx < len(unique_videos) or pending_futures) and not shutdown_requested:
+                while (vid_idx < len(rank_videos) or pending_futures) and not shutdown_requested:
                     # Submit new reads up to the inflight limit
-                    while vid_idx < len(unique_videos) and len(pending_futures) < max_inflight:
-                        fut = pool.submit(_read_one, unique_videos[vid_idx])
+                    while vid_idx < len(rank_videos) and len(pending_futures) < max_inflight:
+                        fut = pool.submit(_read_one, rank_videos[vid_idx])
                         pending_futures.add(fut)
                         vid_idx += 1
 
@@ -445,7 +500,7 @@ def main():
     grid_buffer = []          # Flat list of grid images from multiple videos
     buffer_provenance = []    # [(video_rel_path, metadata, start_idx, count), ...]
     processed_count = 0
-    pbar = tqdm(total=len(unique_videos), desc="Processing videos")
+    pbar = tqdm(total=len(rank_videos), desc=f"Rank {rank} videos")
 
     def flush_buffer():
         """Score all accumulated grids on GPU and distribute results."""
@@ -461,6 +516,7 @@ def main():
                 "sample_interval": vmeta["sample_interval"],
                 "num_queries": vcount,
             }
+            rank_results[vpath] = results[vpath]
         grid_buffer = []
         buffer_provenance = []
 
@@ -496,13 +552,15 @@ def main():
         # Periodic save (every 500 videos)
         if processed_count % 500 == 0:
             flush_buffer()
-            with open(args.output_path, 'w') as f:
-                json.dump(results, f)
+            if distributed:
+                save_json_atomic(rank_result_path, rank_results)
+            else:
+                save_json_atomic(args.output_path, results)
             elapsed = time.time() - start_time
             rate = processed_count / elapsed
-            eta = (len(unique_videos) - processed_count) / rate
-            logging.info(
-                f"Progress: {processed_count}/{len(unique_videos)} "
+            eta = (len(rank_videos) - processed_count) / rate
+            log_info(
+                f"Progress: {processed_count}/{len(rank_videos)} "
                 f"({elapsed/60:.1f}min elapsed, ~{eta/60:.1f}min remaining)")
 
         if shutdown_requested:
@@ -514,23 +572,42 @@ def main():
     pbar.close()
     dispatcher.join(timeout=10)
 
-    # Final save
-    with open(args.output_path, 'w') as f:
-        json.dump(results, f)
+    # Save each shard, then let rank 0 publish the merged output.
+    if distributed:
+        save_json_atomic(rank_result_path, rank_results)
+        dist.barrier()
+        if rank == 0:
+            merged_results = dict(existing_results)
+            for worker_rank in range(world_size):
+                worker_path = f"{args.output_path}.rank-{worker_rank}.json"
+                if os.path.exists(worker_path):
+                    with open(worker_path) as f:
+                        merged_results.update(json.load(f))
+            save_json_atomic(args.output_path, merged_results)
+            for worker_rank in range(world_size):
+                worker_path = f"{args.output_path}.rank-{worker_rank}.json"
+                if os.path.exists(worker_path):
+                    os.unlink(worker_path)
+        dist.barrier()
+        dist.destroy_process_group()
+        if rank == 0:
+            results = merged_results
+    else:
+        save_json_atomic(args.output_path, results)
 
     elapsed = time.time() - start_time
-    logging.info(f"\n{'='*60}")
-    logging.info(f"Pre-computation complete!")
-    logging.info(f"  Processed: {len(results)} videos")
-    logging.info(f"  Failed: {len(failed)} videos")
-    logging.info(f"  Time: {elapsed/60:.1f} minutes")
-    logging.info(f"  Output: {args.output_path}")
+    log_info(f"\n{'='*60}")
+    log_info("Pre-computation complete!")
+    log_info(f"  Processed: {len(results)} videos")
+    log_info(f"  Failed: {len(failed)} videos")
+    log_info(f"  Time: {elapsed/60:.1f} minutes")
+    log_info(f"  Output: {args.output_path}")
 
     if failed:
         failed_path = args.output_path.replace('.json', '_failed.json')
-        with open(failed_path, 'w') as f:
-            json.dump(failed, f, indent=2)
-        logging.info(f"  Failed list: {failed_path}")
+        if not distributed or rank == 0:
+            save_json_atomic(failed_path, failed)
+        log_info(f"  Failed list: {failed_path}")
 
 
 if __name__ == "__main__":

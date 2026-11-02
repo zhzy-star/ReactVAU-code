@@ -259,6 +259,15 @@ source scripts/config/paths.sh
 python scripts/precompute/precompute_pg_scores.py --resume
 ```
 
+To use two GPUs, launch one worker per GPU. Each worker loads its own scorer,
+processes a disjoint shard of videos, and rank 0 merges the shards into the
+same `PG_SCORES_PATH` JSON format:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  scripts/precompute/precompute_pg_scores.py --resume
+```
+
 The command uses the same 4 FPS sampling, four-frame grid construction, 384x384 encoder, layer `-2`, and Stage-1 adapter as evaluation. Results are written to `PG_SCORES_PATH`; `--resume` retains completed videos when restarting an interrupted run. The final log reports the number of processed and failed videos. If any failures are reported, inspect the adjacent `*_failed.json`, repair the missing video paths, and rerun with `--resume` before Stage 2.
 
 Check that the generated JSON is readable and contains entries:
