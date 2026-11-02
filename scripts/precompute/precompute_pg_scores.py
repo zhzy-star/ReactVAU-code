@@ -53,6 +53,15 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
+PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from vad.paligemma_utils import (
+    load_streamforest_vision_weights, patch_vision_feature_layer, validate_lora_path,
+    last_token_logits,
+)
+
 # Suppress warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -112,79 +121,8 @@ def create_grid_image(frames, grid_size=(2, 2), image_size=448):
 
 
 # ===================== Vision Encoder Utilities =====================
-from safetensors.torch import load_file as safetensors_load_file
 from peft import PeftModel
 from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
-import types
-
-
-def load_streamforest_vision_weights(model, weights_path):
-    logging.info(f"Loading StreamForest vision weights from: {weights_path}")
-    stream_weights = safetensors_load_file(weights_path)
-    logging.info(f"  Loaded {len(stream_weights)} tensors from StreamForest")
-
-    # Filter to vision_model keys only (match eval script)
-    remapped = {}
-    for key, value in stream_weights.items():
-        new_key = key.replace("vision_tower.vision_tower.", "")
-        if new_key.startswith("vision_model."):
-            remapped[new_key] = value
-
-    # Resize model's position embedding BEFORE loading weights (match eval script)
-    pos_key = "vision_model.embeddings.position_embedding.weight"
-    if pos_key in remapped:
-        new_pos_shape = remapped[pos_key].shape
-        old_pos_shape = model.vision_tower.vision_model.embeddings.position_embedding.weight.shape
-        logging.info(f"  Position embedding: {old_pos_shape} -> {new_pos_shape}")
-
-        new_num_positions = new_pos_shape[0]  # 729
-        embed_dim = new_pos_shape[1]          # 1152
-
-        model.vision_tower.vision_model.embeddings.position_embedding = torch.nn.Embedding(
-            new_num_positions, embed_dim
-        ).to(model.device).to(model.dtype)
-        logging.info(f"  Resized position embedding to {new_num_positions} positions")
-
-    # Load StreamForest weights
-    missing, unexpected = model.vision_tower.load_state_dict(remapped, strict=False)
-    logging.info(f"  Missing keys (kept from PaliGemma): {len(missing)}")
-    logging.info(f"  Unexpected keys: {len(unexpected)}")
-
-    model.vision_tower.vision_model.embeddings.num_positions = 729
-    embeddings_module = model.vision_tower.vision_model.embeddings
-    embeddings_module.register_buffer(
-        "position_ids",
-        torch.arange(729, device=model.device).expand((1, -1)),
-        persistent=False,
-    )
-    model.config.vision_config.image_size = 384
-    model.config.vision_config.num_image_tokens = 729
-    model.config.vision_config.num_positions = 729
-    model.config.text_config.num_image_tokens = 729
-    logging.info(f"  Config updated: image_size=384, num_image_tokens=729")
-    return model
-
-
-def patch_vision_feature_layer(model, select_layer=-2):
-    if hasattr(model, 'get_image_features'):
-        target = model
-    elif hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
-        target = model.base_model.model
-    else:
-        target = model
-
-    def get_image_features_with_layer_select(self, pixel_values):
-        vision_outputs = self.vision_tower(
-            pixel_values, output_hidden_states=True)
-        selected = vision_outputs.hidden_states[select_layer]
-        image_features = self.multi_modal_projector(selected)
-        image_features = image_features / (self.config.hidden_size ** 0.5)
-        return image_features
-
-    target.get_image_features = types.MethodType(
-        get_image_features_with_layer_select, target)
-    logging.info(f"  Patched get_image_features to use layer {select_layer}")
-    return model
 
 
 class PaliGemmaScorer:
@@ -193,6 +131,7 @@ class PaliGemmaScorer:
     def __init__(self, model_path, lora_path, device="cuda:0",
                  image_size=384, streamforest_weights_path=None,
                  vision_feature_layer=-2, attn_implementation="sdpa"):
+        validate_lora_path(lora_path)
         self.device = torch.device(device)
         self.torch_dtype = torch.bfloat16
         self.image_size = image_size
@@ -211,7 +150,7 @@ class PaliGemmaScorer:
             self.processor.image_seq_length = 729
             logging.info(f"[PaliGemma] Processor updated for 384x384")
 
-        if lora_path and os.path.exists(lora_path):
+        if lora_path:
             logging.info(f"[PaliGemma] Loading LoRA from {lora_path}...")
             self.model = PeftModel.from_pretrained(
                 self.model, lora_path, torch_dtype=self.torch_dtype)
@@ -250,16 +189,9 @@ class PaliGemmaScorer:
             if "pixel_values" in inputs:
                 inputs["pixel_values"] = inputs["pixel_values"].to(self.torch_dtype)
             with torch.inference_mode():
-                outputs = self.model(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    pixel_values=inputs["pixel_values"],
-                )
-                logits = outputs.logits
+                logits = last_token_logits(self.model, inputs)
                 for idx in range(len(batch_imgs)):
-                    attention = inputs["attention_mask"][idx]
-                    last_pos = attention.sum().item() - 1
-                    last_logits = logits[idx, last_pos]
+                    last_logits = logits[idx]
                     yes_logit = max(
                         last_logits[self.yes_token_id].float(),
                         last_logits[self.yes_lower_token_id].float())
@@ -268,7 +200,7 @@ class PaliGemmaScorer:
                         last_logits[self.no_lower_token_id].float())
                     probs = F.softmax(torch.stack([yes_logit, no_logit]), dim=0)
                     all_scores.append(round(probs[0].item(), 4))
-            del inputs, outputs, logits
+            del inputs, logits
         return all_scores
 
 
@@ -393,7 +325,7 @@ def main():
         parser.error(f"HIVAU training annotation not found: {args.anno_path}")
 
     # Setup
-    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+    Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
 
     # Add project root to path for get_prompt import
     sys.path.insert(0, default_project_root)
@@ -421,6 +353,10 @@ def main():
         logging.info(f"Resuming: {len(existing_results)} videos already processed")
         unique_videos = [v for v in unique_videos if v not in existing_results]
         logging.info(f"Remaining: {len(unique_videos)} videos to process")
+
+    if not unique_videos:
+        logging.info("All annotation videos are already processed; no inference needed.")
+        return
 
     # Load PG model
     logging.info("Loading PaliGemma model...")

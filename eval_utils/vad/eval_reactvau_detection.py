@@ -26,35 +26,6 @@ Scoring:
     - Metrics computed at frame level (same as eval_paligemma_detection.py)
 """
 
-from detect_utils import compute_metrics, gaussian_smooth_1d, OnlineSmoother, load_anno_txt, make_gt_labels_from_anno
-from llava.model.multimodal_projector.memory_manager import MemoryManager
-from llava.conversation import conv_templates, SeparatorStyle
-from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
-from llava.mm_utils import get_model_name_from_path, tokenizer_image_token, KeywordsStoppingCriteria
-from llava.model.builder import load_pretrained_model
-from vad.get_prompt import (
-    get_grid_prompt,
-    get_sf_prompt,
-)
-from peft import PeftModel
-from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
-from safetensors.torch import load_file as safetensors_load_file
-import types
-from tqdm import tqdm
-from PIL import Image
-import PIL.Image
-import numpy as np
-import traceback
-import warnings
-import logging
-import datetime
-import time
-import random
-import argparse
-import torch.nn.functional as F
-import torch
-import json
-import cv2
 import os
 import sys
 
@@ -70,6 +41,39 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+
+from vad.paligemma_utils import (
+    load_streamforest_vision_weights, patch_vision_feature_layer, validate_lora_path,
+    last_token_logits,
+)
+
+from detect_utils import compute_metrics, gaussian_smooth_1d, OnlineSmoother, load_anno_txt, make_gt_labels_from_anno
+from llava.model.multimodal_projector.memory_manager import MemoryManager
+from llava.conversation import conv_templates, SeparatorStyle
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+from llava.mm_utils import get_model_name_from_path, tokenizer_image_token, KeywordsStoppingCriteria
+from llava.model.builder import load_pretrained_model
+from vad.get_prompt import (
+    get_grid_prompt,
+    get_sf_prompt,
+)
+from peft import PeftModel
+from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
+from tqdm import tqdm
+from PIL import Image
+import PIL.Image
+import numpy as np
+import traceback
+import warnings
+import logging
+import datetime
+import time
+import random
+import argparse
+import torch.nn.functional as F
+import torch
+import json
+import cv2
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -139,84 +143,6 @@ def create_grid_image(frames: list, grid_size: tuple = (2, 2), image_size: int =
     return grid_image
 
 
-# ===================== StreamForest Vision Encoder (384x384 support) =====================
-def load_streamforest_vision_weights(model, weights_path: str):
-    """Replace PaliGemma's vision encoder with StreamForest's SigLIP-384 weights."""
-    logging.info(f"Loading StreamForest vision weights from: {weights_path}")
-
-    stream_weights = safetensors_load_file(weights_path)
-    logging.info(f"  Loaded {len(stream_weights)} tensors from StreamForest")
-
-    remapped = {}
-    for key, value in stream_weights.items():
-        if key.startswith("vision_model."):
-            remapped[key] = value
-
-    pos_key = "vision_model.embeddings.position_embedding.weight"
-    if pos_key in remapped:
-        new_pos_shape = remapped[pos_key].shape
-        old_pos_shape = model.vision_tower.vision_model.embeddings.position_embedding.weight.shape
-        logging.info(
-            f"  Position embedding: {old_pos_shape} -> {new_pos_shape}")
-
-        new_num_positions = new_pos_shape[0]
-        embed_dim = new_pos_shape[1]
-
-        model.vision_tower.vision_model.embeddings.position_embedding = torch.nn.Embedding(
-            new_num_positions, embed_dim
-        ).to(model.device).to(model.dtype)
-        logging.info(
-            f"  Resized position embedding to {new_num_positions} positions")
-
-    missing, unexpected = model.vision_tower.load_state_dict(
-        remapped, strict=False)
-    logging.info(f"  Missing keys (kept from PaliGemma): {len(missing)}")
-    logging.info(f"  Unexpected keys: {len(unexpected)}")
-
-    model.vision_tower.vision_model.embeddings.num_positions = 729
-    embeddings_module = model.vision_tower.vision_model.embeddings
-    embeddings_module.register_buffer(
-        "position_ids",
-        torch.arange(729, device=model.device).expand((1, -1)),
-        persistent=False,
-    )
-
-    model.config.vision_config.image_size = 384
-    model.config.vision_config.num_image_tokens = 729
-    model.config.vision_config.num_positions = 729
-    model.config.text_config.num_image_tokens = 729
-
-    logging.info(f"  Config updated: image_size=384, num_image_tokens=729")
-    return model
-
-
-def patch_vision_feature_layer(model, select_layer: int = -2):
-    """Monkey-patch get_image_features to extract from a specific encoder layer."""
-    # Determine the target model to patch
-    # After merge_and_unload(): PaliGemmaForConditionalGeneration -> patch directly
-    # During PEFT training: PeftModel -> need base_model.model
-    if hasattr(model, 'get_image_features'):
-        target = model
-    elif hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
-        target = model.base_model.model
-    else:
-        target = model
-
-    def get_image_features_with_layer_select(self, pixel_values):
-        image_outputs = self.vision_tower(
-            pixel_values, output_hidden_states=True)
-        selected_image_feature = image_outputs.hidden_states[select_layer]
-        image_features = self.multi_modal_projector(selected_image_feature)
-        image_features = image_features / (self.config.hidden_size ** 0.5)
-        return image_features
-
-    target.get_image_features = types.MethodType(
-        get_image_features_with_layer_select, target
-    )
-    logging.info(f"  Patched get_image_features to use layer {select_layer}")
-    return model
-
-
 # ===================== PaliGemma Detection Module =====================
 
 class PaliGemmaDetector:
@@ -233,6 +159,7 @@ class PaliGemmaDetector:
         streamforest_weights_path: str = None,
         vision_feature_layer: int = -2,
     ):
+        validate_lora_path(lora_path)
         self.device = torch.device(device)
         self.torch_dtype = torch_dtype
         self.image_size = image_size
@@ -257,7 +184,7 @@ class PaliGemmaDetector:
             logging.info(
                 f"[PaliGemma] Processor updated for 384x384 (729 image tokens)")
 
-        if lora_path is not None and os.path.exists(lora_path):
+        if lora_path:
             logging.info(
                 f"[PaliGemma] Loading LoRA adapter from {lora_path}...")
             self.model = PeftModel.from_pretrained(
@@ -298,13 +225,7 @@ class PaliGemmaDetector:
                 self.torch_dtype)
 
         with torch.inference_mode():
-            outputs = self.model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                pixel_values=inputs["pixel_values"],
-                num_logits_to_keep=1,
-            )
-            last_logits = outputs.logits[0, -1]
+            last_logits = last_token_logits(self.model, inputs)[0]
             yes_logit = max(last_logits[self.yes_token_id].float(
             ), last_logits[self.yes_lower_token_id].float())
             no_logit = max(last_logits[self.no_token_id].float(
@@ -331,16 +252,10 @@ class PaliGemmaDetector:
                 self.torch_dtype)
 
         with torch.inference_mode():
-            outputs = self.model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                pixel_values=inputs["pixel_values"],
-                num_logits_to_keep=1,
-            )
-            logits = outputs.logits
+            logits = last_token_logits(self.model, inputs)
             batch_scores = []
             for batch_idx in range(len(valid_images)):
-                last_logits = logits[batch_idx, -1]
+                last_logits = logits[batch_idx]
                 yes_logit = max(last_logits[self.yes_token_id].float(
                 ), last_logits[self.yes_lower_token_id].float())
                 no_logit = max(last_logits[self.no_token_id].float(

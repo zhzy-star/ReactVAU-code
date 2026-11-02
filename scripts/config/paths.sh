@@ -40,11 +40,13 @@ export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.1}"
 # instruction/, and raw_annotations/.
 export HIVAU_ROOT="${HIVAU_ROOT:-/path/to/HIVAU-70k}"
 export HIVAU_VIDEO_ROOT="${HIVAU_VIDEO_ROOT:-${HIVAU_ROOT}/videos}"
-export VAD_TRAIN_ROOT="${VAD_TRAIN_ROOT:-${REACTVAU_ROOT}/vad/vad_data/paligemma_train}"
+export VAD_TRAIN_ROOT="${VAD_TRAIN_ROOT:-${REACTVAU_ROOT}/vad/vad_data/paligemma_train_fixed}"
 
 # PaliGemma detection module.
 export PALIGEMMA_MODEL_PATH="${PALIGEMMA_MODEL_PATH:-${CKPT_ROOT}/paligemma2-3b-mix-448}"
-export PALIGEMMA_LORA_PATH="${PALIGEMMA_LORA_PATH:-${CKPT_ROOT}/paligemma2-3b-vad-lora-384-combined-binary/training_384}"
+export PALIGEMMA_TRAIN_OUTPUT_DIR="${PALIGEMMA_TRAIN_OUTPUT_DIR:-${CKPT_ROOT}/paligemma2-3b-vad-lora-384-combined-binary/training_384}"
+# Select a completed run/checkpoint containing adapter_config.json for inference.
+export PALIGEMMA_LORA_PATH="${PALIGEMMA_LORA_PATH:-${PALIGEMMA_TRAIN_OUTPUT_DIR}}"
 export PALIGEMMA_SF_WEIGHTS="${PALIGEMMA_SF_WEIGHTS:-${CKPT_ROOT}/extracted_weights/streamforest_vision_encoder_with_prefix.safetensors}"
 
 # ReactVAU reasoning module.

@@ -13,11 +13,6 @@ import os
 import numpy as np
 import torch
 import yaml
-from bleurt_pytorch import (
-    BleurtConfig,
-    BleurtForSequenceClassification,
-    BleurtTokenizer,
-)
 from loguru import logger as eval_logger
 from pycocoevalcap.eval import Bleu, Cider, COCOEvalCap, Meteor, Rouge, Spice
 from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer

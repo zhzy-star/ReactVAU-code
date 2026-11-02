@@ -196,14 +196,16 @@ export CUDA_HOME="/usr/local/cuda-12.1"
 
 export PALIGEMMA_MODEL_PATH="${CKPT_ROOT}/paligemma2-3b-mix-448"
 export PALIGEMMA_SF_WEIGHTS="${CKPT_ROOT}/extracted_weights/streamforest_vision_encoder_with_prefix.safetensors"
-export PALIGEMMA_LORA_PATH="${CKPT_ROOT}/paligemma2-3b-vad-lora-384-combined-binary/training_384"
+export PALIGEMMA_TRAIN_OUTPUT_DIR="${CKPT_ROOT}/paligemma2-3b-vad-lora-384-combined-binary/training_384"
+# After Stage 1, set this to the actual completed run directory.
+export PALIGEMMA_LORA_PATH="${PALIGEMMA_TRAIN_OUTPUT_DIR}/training_<timestamp>"
 export STREAMFOREST_MODEL_BASE="${CKPT_ROOT}/StreamForest-Qwen2-7B_Siglip"
 
 export HIVAU_TRAIN_JSON="${HIVAU_ROOT}/instruction/merge_instruction_train_final.json"
 export PG_SCORES_PATH="${REACTVAU_ROOT}/precomputed/pg_scores_hivau_train.json"
 ```
 
-`PALIGEMMA_LORA_PATH` and `PG_SCORES_PATH` are output locations until Stage 1 and precompute finish. `REACTVAU_CHECKPOINT_PATH` is added after Stage 2, as described below. Every variable can also be overridden for one command, for example `HIVAU_ROOT=/data/HIVAU-70k bash ...`.
+`PALIGEMMA_TRAIN_OUTPUT_DIR` is the Stage-1 output root; `PALIGEMMA_LORA_PATH` selects a completed run or checkpoint for inference. `PG_SCORES_PATH` is the precompute output location. `REACTVAU_CHECKPOINT_PATH` is added after Stage 2, as described below. Every variable can also be overridden for one command, for example `HIVAU_ROOT=/data/HIVAU-70k bash ...`.
 
 ## Reproduction workflow
 
@@ -227,10 +229,10 @@ Then construct the full dataset at the configured `VAD_TRAIN_ROOT`:
 bash scripts/gen_data/gen_train_data.sh
 ```
 
-The default output directory is `vad/vad_data/paligemma_train/` (or `VAD_TRAIN_ROOT` if overridden):
+The default output directory is `vad/vad_data/paligemma_train_fixed/` (or `VAD_TRAIN_ROOT` if overridden):
 
 ```text
-vad/vad_data/paligemma_train/
+vad/vad_data/paligemma_train_fixed/
   train_images/                         # 384x384 PNG grids
   ucf_crime_train_binary.json
   xd_violence_train_binary.json
@@ -246,7 +248,7 @@ Before training, confirm that `combined_train_binary.json` is non-empty and that
 bash scripts/train/finetune-vad/train_paligemma_vad_384.sh
 ```
 
-The default run uses 384x384 grid images, the extracted shared vision encoder, vision layer `-2`, a frozen vision encoder, LoRA on the PaliGemma2 language model, and a trainable multimodal projector. It writes the selected adapter and processor files to `PALIGEMMA_LORA_PATH`. A successful output contains `adapter_config.json` and `adapter_model.*`.
+The default run uses 384x384 grid images, the extracted shared vision encoder, vision layer `-2`, a frozen vision encoder, LoRA on the PaliGemma2 language model, and a trainable multimodal projector. It writes adapter and processor files to a timestamped `training_<timestamp>/` directory below `PALIGEMMA_TRAIN_OUTPUT_DIR` (or `OUTPUT_DIR` if overridden). Set `PALIGEMMA_LORA_PATH` in `paths.local.sh` to that completed run directory, then source `scripts/config/paths.sh` again before precompute or evaluation. A successful output contains `adapter_config.json` and `adapter_model.*`; the parent output root is not an adapter directory.
 
 ### 3. Precompute Fast-module scores for Stage 2
 

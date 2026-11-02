@@ -810,7 +810,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_HIVAU_ROOT = os.environ.get("HIVAU_ROOT", "/path/to/HIVAU-70k")
 DEFAULT_VAD_TRAIN_ROOT = os.environ.get(
     "VAD_TRAIN_ROOT",
-    os.path.join(REPO_ROOT, "vad_data", "paligemma_train"),
+    os.path.join(REPO_ROOT, "vad", "vad_data", "paligemma_train_fixed"),
 )
 
 

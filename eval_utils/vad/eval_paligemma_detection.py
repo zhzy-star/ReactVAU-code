@@ -38,8 +38,6 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
 from peft import PeftModel
-from safetensors.torch import load_file as safetensors_load_file
-import types
 
 # Add ReactVAU path dynamically
 ReactVAU_ROOT = os.path.dirname(os.path.dirname(
@@ -47,7 +45,16 @@ ReactVAU_ROOT = os.path.dirname(os.path.dirname(
 if ReactVAU_ROOT not in sys.path:
     sys.path.append(ReactVAU_ROOT)
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
 from detect_utils import compute_metrics, gaussian_smooth_1d, load_anno_txt, make_gt_labels_from_anno
+from vad.paligemma_utils import (
+    load_streamforest_vision_weights, patch_vision_feature_layer, validate_lora_path,
+    last_token_logits,
+)
+
 from vad.get_prompt import get_grid_prompt
 
 # Suppress warnings
@@ -124,100 +131,6 @@ def create_grid_image(frames: list, grid_size: tuple = (2, 2), image_size: int =
     return grid_image
 
 
-# ===================== StreamForest Vision Encoder (384x384 support) =====================
-def load_streamforest_vision_weights(model, weights_path: str):
-    """Replace PaliGemma's vision encoder with StreamForest's SigLIP-384 weights.
-
-    Steps:
-    1. Load StreamForest weights from safetensors
-    2. Resize position embedding from 1024 (448px) to 729 (384px)
-    3. Load weights with strict=False (layer 26 kept from PaliGemma original)
-    4. Update model config for 384x384 input
-    """
-    print(f"Loading StreamForest vision weights from: {weights_path}")
-
-    stream_weights = safetensors_load_file(weights_path)
-    print(f"  Loaded {len(stream_weights)} tensors from StreamForest")
-
-    # Filter to vision_model keys only
-    remapped = {}
-    for key, value in stream_weights.items():
-        if key.startswith("vision_model."):
-            remapped[key] = value
-
-    # Resize position embedding BEFORE loading weights
-    pos_key = "vision_model.embeddings.position_embedding.weight"
-    if pos_key in remapped:
-        new_pos_shape = remapped[pos_key].shape
-        old_pos_shape = model.vision_tower.vision_model.embeddings.position_embedding.weight.shape
-        print(f"  Position embedding: {old_pos_shape} -> {new_pos_shape}")
-
-        new_num_positions = new_pos_shape[0]  # 729
-        embed_dim = new_pos_shape[1]          # 1152
-
-        model.vision_tower.vision_model.embeddings.position_embedding = torch.nn.Embedding(
-            new_num_positions, embed_dim
-        ).to(model.device).to(model.dtype)
-        print(f"  Resized position embedding to {new_num_positions} positions")
-
-    # Load StreamForest weights
-    missing, unexpected = model.vision_tower.load_state_dict(
-        remapped, strict=False)
-    print(f"  Missing keys (kept from PaliGemma): {len(missing)}")
-    print(f"  Unexpected keys: {len(unexpected)}")
-
-    # Update position-related state in embeddings
-    model.vision_tower.vision_model.embeddings.num_positions = 729
-    embeddings_module = model.vision_tower.vision_model.embeddings
-    embeddings_module.register_buffer(
-        "position_ids",
-        torch.arange(729, device=model.device).expand((1, -1)),
-        persistent=False,
-    )
-
-    # Update model config
-    model.config.vision_config.image_size = 384
-    model.config.vision_config.num_image_tokens = 729
-    model.config.vision_config.num_positions = 729
-    model.config.text_config.num_image_tokens = 729
-
-    print(f"  Config updated: image_size=384, num_image_tokens=729")
-    return model
-
-
-def patch_vision_feature_layer(model, select_layer: int = -2):
-    """Monkey-patch get_image_features to extract from a specific encoder layer.
-
-    StreamForest uses select_layer=-2 (layer 25), but PaliGemma defaults to
-    the last layer (layer 26). Since layer 26 is kept from PaliGemma's original
-    weights (not StreamForest-trained), using layer -2 preserves the features
-    StreamForest was optimized for.
-    """
-    # Determine the target model to patch
-    # After merge_and_unload(): PaliGemmaForConditionalGeneration -> patch directly
-    # During PEFT training: PeftModel -> need base_model.model
-    if hasattr(model, 'get_image_features'):
-        target = model
-    elif hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
-        target = model.base_model.model
-    else:
-        target = model
-
-    def get_image_features_with_layer_select(self, pixel_values):
-        image_outputs = self.vision_tower(
-            pixel_values, output_hidden_states=True)
-        selected_image_feature = image_outputs.hidden_states[select_layer]
-        image_features = self.multi_modal_projector(selected_image_feature)
-        image_features = image_features / (self.config.hidden_size ** 0.5)
-        return image_features
-
-    target.get_image_features = types.MethodType(
-        get_image_features_with_layer_select, target
-    )
-    print(f"  Patched get_image_features to use layer {select_layer}")
-    return model
-
-
 class PaliGemmaAnomalyDetector:
     """
     PaliGemma/PaliGemma2-based Anomaly Detection for Fine-tuned Model
@@ -250,6 +163,7 @@ class PaliGemmaAnomalyDetector:
             streamforest_weights_path: Path to StreamForest vision encoder weights (required for 384)
             vision_feature_layer: Vision feature layer (-1 for last, -2 for StreamForest recommended)
         """
+        validate_lora_path(lora_path)
         self.device = torch.device(device)
         self.torch_dtype = torch_dtype
         self.image_size = image_size
@@ -279,7 +193,7 @@ class PaliGemmaAnomalyDetector:
             print(f"  Processor updated for 384x384 (729 image tokens)")
 
         # Load LoRA adapter if provided
-        if lora_path is not None and os.path.exists(lora_path):
+        if lora_path:
             print(f"Loading LoRA adapter from {lora_path}...")
             self.model = PeftModel.from_pretrained(
                 self.model,
@@ -411,18 +325,11 @@ class PaliGemmaAnomalyDetector:
         """
         with torch.inference_mode():
             # Direct forward pass (matches training evaluation)
-            outputs = self.model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                pixel_values=inputs["pixel_values"],
-                num_logits_to_keep=1,
-            )
-
-            logits = outputs.logits  # [1, seq_len, vocab_size]
+            logits = last_token_logits(self.model, inputs)
 
             # Get logits at the last position (predicting first token)
             # This matches training's prediction_step logic
-            last_logits = logits[0, -1]  # [vocab_size]
+            last_logits = logits[0]  # [vocab_size]
 
             # Get Yes and No logits (check both uppercase and lowercase)
             yes_logit = max(
@@ -518,21 +425,14 @@ class PaliGemmaAnomalyDetector:
 
         with torch.inference_mode():
             # Direct forward pass (matches training evaluation)
-            outputs = self.model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                pixel_values=inputs["pixel_values"],
-                num_logits_to_keep=1,
-            )
-
-            logits = outputs.logits  # [batch_size, seq_len, vocab_size]
+            logits = last_token_logits(self.model, inputs)
             batch_size = logits.shape[0]
 
             batch_scores = []
             batch_texts = []
 
             for batch_idx in range(batch_size):
-                last_logits = logits[batch_idx, -1]  # [vocab_size]
+                last_logits = logits[batch_idx]  # [vocab_size]
 
                 # Get Yes and No logits (check both uppercase and lowercase)
                 yes_logit = max(

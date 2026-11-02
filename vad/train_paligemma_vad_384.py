@@ -17,7 +17,6 @@ Key differences from train_paligemma_vad.py:
 import os
 import sys
 import json
-import types
 import torch
 import torch.nn.functional as F
 import logging
@@ -32,7 +31,6 @@ from collections import defaultdict
 import numpy as np
 from sklearn.metrics import roc_auc_score
 
-import safetensors.torch as safetensors
 
 import transformers
 from transformers import (
@@ -52,7 +50,11 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 # Import prompt from centralized location
-from get_prompt import get_grid_prompt
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from vad.get_prompt import get_grid_prompt
+from vad.paligemma_utils import (
+    load_streamforest_vision_weights, patch_vision_feature_layer,
+)
 
 GRID_PROMPT = get_grid_prompt(add_special_tokens=False)
 
@@ -98,7 +100,7 @@ PROJECT_ROOT = os.environ.get(
 CKPT_ROOT = os.environ.get("CKPT_ROOT", os.path.join(PROJECT_ROOT, "ckpt"))
 VAD_TRAIN_ROOT = os.environ.get(
     "VAD_TRAIN_ROOT",
-    os.path.join(PROJECT_ROOT, "vad", "vad_data", "paligemma_train")
+    os.path.join(PROJECT_ROOT, "vad", "vad_data", "paligemma_train_fixed")
 )
 
 
@@ -222,7 +224,7 @@ class VADTrainingArguments(TrainingArguments):
     """Extended training arguments for VAD."""
     output_dir: str = field(
         default=os.environ.get(
-            "PALIGEMMA_LORA_PATH",
+            "PALIGEMMA_TRAIN_OUTPUT_DIR",
             os.path.join(CKPT_ROOT, "paligemma2-3b-vad-lora-384-combined-binary", "training_384")
         )
     )
@@ -578,7 +580,9 @@ class VADDataset(Dataset):
             suffix=[suffix_with_eos],
             return_tensors="pt",
             padding="max_length",
-            max_length=self.max_length,
+            # Transformers 5 treats max_length as the complete multimodal
+            # sequence length, including the 729 image tokens.
+            max_length=self.max_length + getattr(self.processor, "image_seq_length", 729),
             truncation=True,
         )
 
@@ -751,7 +755,7 @@ class VADTrainer(Trainer):
 
         return (total_loss, outputs) if return_outputs else total_loss
 
-    def log(self, logs: Dict[str, float]) -> None:
+    def log(self, logs: Dict[str, float], start_time: float = None) -> None:
         if "loss" in logs:
             if self._accumulated_yes_probs:
                 self._logged_yes_prob = sum(
@@ -798,7 +802,13 @@ class VADTrainer(Trainer):
             except Exception as e:
                 pass
 
-        super().log(logs)
+        # Transformers 5 passes the optional logging start time through this
+        # hook. Preserve it for the base Trainer while remaining compatible
+        # with older versions that ignore the second argument.
+        try:
+            super().log(logs, start_time=start_time)
+        except TypeError:
+            super().log(logs)
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         """Override to compute anomaly scores for AUC.
@@ -909,118 +919,6 @@ def compute_metrics(eval_pred):
     }
 
 
-# ===================== StreamForest Vision Encoder Loading =====================
-def load_streamforest_vision_weights(model, weights_path: str):
-    """Replace PaliGemma's vision encoder with StreamForest's SigLIP-384 weights.
-
-    Steps:
-    1. Load StreamForest weights from safetensors
-    2. Resize position embedding from 1024 (448px) to 729 (384px)
-    3. Load weights with strict=False (layer 26 kept from PaliGemma original)
-    4. Update model config for 384x384 input
-
-    Args:
-        model: PaliGemmaForConditionalGeneration model (on GPU)
-        weights_path: Path to streamforest_vision_encoder_with_prefix.safetensors
-
-    Returns:
-        model with StreamForest vision weights loaded
-    """
-    logger.info(f"Loading StreamForest vision weights from: {weights_path}")
-
-    # Load weights
-    stream_weights = safetensors.load_file(weights_path)
-    logger.info(f"  Loaded {len(stream_weights)} tensors from StreamForest")
-
-    # Filter to vision_model keys only
-    remapped = {}
-    for key, value in stream_weights.items():
-        if key.startswith("vision_model."):
-            remapped[key] = value
-
-    # Step 1: Resize position embedding BEFORE loading weights
-    pos_key = "vision_model.embeddings.position_embedding.weight"
-    if pos_key in remapped:
-        new_pos_shape = remapped[pos_key].shape
-        old_pos_shape = model.vision_tower.vision_model.embeddings.position_embedding.weight.shape
-        logger.info(
-            f"  Position embedding: {old_pos_shape} -> {new_pos_shape}")
-
-        new_num_positions = new_pos_shape[0]  # 729
-        embed_dim = new_pos_shape[1]          # 1152
-
-        # Replace the embedding module
-        model.vision_tower.vision_model.embeddings.position_embedding = torch.nn.Embedding(
-            new_num_positions, embed_dim
-        ).to(model.device).to(model.dtype)
-        logger.info(
-            f"  ✓ Resized position embedding to {new_num_positions} positions")
-
-    # Step 2: Load StreamForest weights
-    missing, unexpected = model.vision_tower.load_state_dict(
-        remapped, strict=False)
-    logger.info(f"  Missing keys (kept from PaliGemma): {len(missing)}")
-    logger.info(f"  Unexpected keys: {len(unexpected)}")
-
-    if missing:
-        logger.info(
-            f"  Sample missing keys (layer 26, kept PaliGemma original):")
-        for k in missing[:5]:
-            logger.info(f"    - {k}")
-
-    # Step 3: Update position-related state in embeddings
-    model.vision_tower.vision_model.embeddings.num_positions = 729
-    # Use register_buffer so position_ids moves with the model on .to() / DataParallel
-    embeddings_module = model.vision_tower.vision_model.embeddings
-    embeddings_module.register_buffer(
-        "position_ids",
-        torch.arange(729, device=model.device).expand((1, -1)),
-        persistent=False,
-    )
-
-    # Step 4: Update model config
-    model.config.vision_config.image_size = 384
-    model.config.vision_config.num_image_tokens = 729
-    model.config.vision_config.num_positions = 729
-    model.config.text_config.num_image_tokens = 729
-
-    logger.info(f"  ✓ Config updated: image_size=384, num_image_tokens=729")
-
-    return model
-
-
-# ===================== Vision Feature Layer Patch =====================
-def patch_vision_feature_layer(model, select_layer: int = -2):
-    """Monkey-patch get_image_features to extract from a specific encoder layer.
-
-    StreamForest uses select_layer=-2 (layer 25), but PaliGemma defaults to
-    the last layer (layer 26). Since layer 26 is kept from PaliGemma's original
-    weights (not StreamForest-trained), using layer -2 preserves the features
-    StreamForest was optimized for.
-
-    Args:
-        model: PaliGemmaForConditionalGeneration or PEFT-wrapped model
-        select_layer: -1 = last layer, -2 = second-to-last (recommended)
-    """
-    base_model = model
-    if hasattr(model, 'base_model'):
-        base_model = model.base_model.model
-
-    def get_image_features_with_layer_select(self, pixel_values):
-        image_outputs = self.vision_tower(
-            pixel_values, output_hidden_states=True)
-        selected_image_feature = image_outputs.hidden_states[select_layer]
-        image_features = self.multi_modal_projector(selected_image_feature)
-        image_features = image_features / (self.config.hidden_size ** 0.5)
-        return image_features
-
-    base_model.get_image_features = types.MethodType(
-        get_image_features_with_layer_select, base_model
-    )
-    logger.info(f"  ✓ Patched get_image_features to use layer {select_layer}")
-    return model
-
-
 # ===================== Model Setup =====================
 def setup_model_and_processor(model_args: ModelArguments):
     """Setup PaliGemma2 model with StreamForest vision encoder and LoRA."""
@@ -1071,11 +969,18 @@ def setup_model_and_processor(model_args: ModelArguments):
         logger.info(
             f"Setting up LoRA (r={model_args.lora_r}, alpha={model_args.lora_alpha})...")
 
+        # Match only language-model blocks; the vision tower has the same
+        # projection suffixes and must remain frozen.
+        language_lora_pattern = (
+            r"(?:model\.language_model|language_model\.model)\.layers\.\d+\."
+            r"(self_attn\.(q_proj|k_proj|v_proj|o_proj)|"
+            r"mlp\.(gate_proj|up_proj|down_proj))"
+        )
         lora_config = LoraConfig(
             r=model_args.lora_r,
             lora_alpha=model_args.lora_alpha,
             lora_dropout=model_args.lora_dropout,
-            target_modules=r"language_model\.model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|mlp\.(gate_proj|up_proj|down_proj))",
+            target_modules=language_lora_pattern,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
             modules_to_save=["multi_modal_projector"],
