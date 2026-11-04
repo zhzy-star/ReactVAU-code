@@ -57,7 +57,7 @@ from vad.get_prompt import (
     get_grid_prompt,
     get_sf_prompt,
 )
-from peft import PeftModel
+from peft import PeftConfig, PeftModel
 from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
 from tqdm import tqdm
 from PIL import Image
@@ -187,8 +187,25 @@ class PaliGemmaDetector:
         if lora_path:
             logging.info(
                 f"[PaliGemma] Loading LoRA adapter from {lora_path}...")
+            # The saved adapter was trained with a wrapper that named the
+            # language model `model.language_model`; Transformers exposes it
+            # as `language_model.model` during evaluation.
+            peft_config = PeftConfig.from_pretrained(lora_path)
+            peft_config.target_modules = (
+                r"(?:model\.language_model|language_model\.model)\.layers\.\d+\."
+                r"(self_attn\.(q_proj|k_proj|v_proj|o_proj)|"
+                r"mlp\.(gate_proj|up_proj|down_proj))"
+            )
             self.model = PeftModel.from_pretrained(
-                self.model, lora_path, torch_dtype=torch_dtype)
+                self.model,
+                lora_path,
+                torch_dtype=torch_dtype,
+                config=peft_config,
+                key_mapping={
+                    r"^model\.language_model\.(.*)$": r"language_model.model.\1",
+                    r"^model\.multi_modal_projector\.(.*)$": r"multi_modal_projector.\1",
+                },
+            )
             self.model = self.model.merge_and_unload()
             logging.info("[PaliGemma] LoRA adapter loaded and merged")
 
@@ -420,7 +437,8 @@ class StreamForestReasoner:
                     image_sizes=image_sizes,
             )
 
-            outputs = self.model.model(
+            causal_model = self.model.get_base_model()
+            outputs = causal_model.model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask_prepared,
                 position_ids=position_ids,
@@ -429,7 +447,7 @@ class StreamForestReasoner:
             )
 
             last_hidden = outputs.last_hidden_state[:, -1:, :]
-            last_logits = self.model.lm_head(last_hidden)[0, -1, :]
+            last_logits = causal_model.lm_head(last_hidden)[0, -1, :]
             pos_logit = last_logits[self.positive_token_id].item()
             neg_logit = last_logits[self.negative_token_id].item()
             logits_pair = torch.tensor([pos_logit, neg_logit])
@@ -495,7 +513,8 @@ class StreamForestReasoner:
                     image_sizes=image_sizes,
             )
 
-            outputs = self.model.model(
+            causal_model = self.model.get_base_model()
+            outputs = causal_model.model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask_prepared,
                 position_ids=position_ids,
@@ -504,7 +523,7 @@ class StreamForestReasoner:
             )
 
             last_hidden = outputs.last_hidden_state[:, -1:, :]
-            last_logits = self.model.lm_head(last_hidden)[0, -1, :]
+            last_logits = causal_model.lm_head(last_hidden)[0, -1, :]
 
             # Extract logits for digit tokens "1" through "9"
             digit_logits = []

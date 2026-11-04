@@ -30,8 +30,13 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     if load_8bit:
         kwargs["load_in_8bit"] = True
     elif load_4bit:
-        kwargs["load_in_4bit"] = True
-        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            llm_int8_skip_modules=["vision_tower", "mm_projector"],
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
     else:
         # kwargs["torch_dtype"] = torch.float16
         kwargs["torch_dtype"] = torch.bfloat16
@@ -103,7 +108,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
 
             token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
-            if model.lm_head.weight.shape[0] != token_num:
+            if not load_4bit and model.lm_head.weight.shape[0] != token_num:
                 model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
                 model.model.embed_tokens.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
 
@@ -130,17 +135,74 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     return torch.load(cache_file, map_location=_non_lora_map)
 
                 non_lora_trainables = load_from_hf(model_path, "non_lora_trainables.bin")
-            non_lora_trainables = {(k[11:] if k.startswith("base_model.") else k): v for k, v in non_lora_trainables.items()}
-            if any(k.startswith("model.model.") for k in non_lora_trainables):
-                non_lora_trainables = {(k[6:] if k.startswith("model.") else k): v for k, v in non_lora_trainables.items()}
-            model.load_state_dict(non_lora_trainables, strict=False)
+            if load_4bit:
+                model_state = model.state_dict()
+                restored_state = {}
+                source_keys = {}
+                for source_key, tensor in non_lora_trainables.items():
+                    key = source_key
+                    if key.startswith("base_model."):
+                        key = key[len("base_model."):]
+                    if key.startswith("model.model."):
+                        key = key[len("model."):]
+                    elif key.startswith("model.lm_head."):
+                        key = key[len("model."):]
+                    key = key.replace(".base_layer.", ".")
+
+                    if key not in model_state:
+                        raise RuntimeError(
+                            "QLoRA checkpoint tensor has no matching model parameter: "
+                            f"{source_key} -> {key}"
+                        )
+                    target = model_state[key]
+                    if tensor.shape != target.shape:
+                        raise RuntimeError(
+                            "QLoRA checkpoint tensor shape mismatch: "
+                            f"{source_key} {tuple(tensor.shape)} vs "
+                            f"{key} {tuple(target.shape)}"
+                        )
+
+                    if tensor.dtype == torch.uint8:
+                        current = target.detach().to(device="cpu")
+                        if current.dtype != tensor.dtype or not torch.equal(current, tensor):
+                            raise RuntimeError(
+                                "Rebuilt 4-bit base does not match the packed QLoRA tensor: "
+                                f"{source_key}. Check the base checkpoint and bitsandbytes version."
+                            )
+
+                    if key in restored_state:
+                        if not torch.equal(restored_state[key], tensor):
+                            raise RuntimeError(
+                                "Duplicate QLoRA checkpoint tensors disagree: "
+                                f"{source_keys[key]} and {source_key}"
+                            )
+                    else:
+                        restored_state[key] = tensor
+                        source_keys[key] = source_key
+
+                incompatible = model.load_state_dict(restored_state, strict=False)
+                if incompatible.unexpected_keys:
+                    raise RuntimeError(
+                        "Unexpected QLoRA checkpoint keys: "
+                        + ", ".join(incompatible.unexpected_keys[:10])
+                    )
+                rank0_print(
+                    f"Restored {len(non_lora_trainables)} QLoRA tensors "
+                    f"({len(restored_state)} unique model parameters)."
+                )
+            else:
+                non_lora_trainables = {(k[11:] if k.startswith("base_model.") else k): v for k, v in non_lora_trainables.items()}
+                if any(k.startswith("model.model.") for k in non_lora_trainables):
+                    non_lora_trainables = {(k[6:] if k.startswith("model.") else k): v for k, v in non_lora_trainables.items()}
+                model.load_state_dict(non_lora_trainables, strict=False)
 
             from peft import PeftModel
 
             rank0_print("Loading LoRA weights...")
             model = PeftModel.from_pretrained(model, model_path)
-            rank0_print("Merging LoRA weights...")
-            model = model.merge_and_unload()
+            if not load_4bit:
+                rank0_print("Merging LoRA weights...")
+                model = model.merge_and_unload()
             rank0_print("Model is loaded...")
         elif model_base is not None:  # this may be mm projector only, loading projector with preset language mdoel
             rank0_print(f"Loading LLaVA from base model {model_base}...")
@@ -383,7 +445,20 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
         if mm_use_im_start_end:
             tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
-        model.resize_token_embeddings(len(tokenizer))
+        input_vocab_size = model.get_input_embeddings().weight.shape[0]
+        if len(tokenizer) != input_vocab_size:
+            if load_4bit and len(tokenizer) < input_vocab_size:
+                rank0_print(
+                    f"Keeping the checkpoint vocabulary size ({input_vocab_size}); "
+                    f"the tokenizer has {len(tokenizer)} usable tokens and the remaining rows are padding."
+                )
+            elif load_4bit:
+                raise RuntimeError(
+                    "Cannot expand a quantized QLoRA model vocabulary during inference: "
+                    f"model has {input_vocab_size} rows, tokenizer requires {len(tokenizer)}."
+                )
+            else:
+                model.resize_token_embeddings(len(tokenizer))
 
         vision_tower = model.get_vision_tower()
         if not vision_tower.is_loaded:

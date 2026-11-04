@@ -24,11 +24,11 @@ source "${CONFIG_PATH}"
 reactvau_activate_conda
 
 # Environment variables
-export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128}"
 export TOKENIZERS_PARALLELISM=false
 export NVIDIA_TF32_OVERRIDE=1
-export BNB_CUDA_VERSION=121
+unset BNB_CUDA_VERSION
 export BITSANDBYTES_NOWELCOME=1
 
 # Enable real-time output (unbuffered)
@@ -70,9 +70,9 @@ STREAMFOREST_MODEL_PATH="${STREAMFOREST_MODEL_PATH:-${REACTVAU_CHECKPOINT_PATH}}
 VIDEO_DIR="${VIDEO_DIR:-${HIVAU_ROOT}}"
 DATASET="${DATASET:-ucf-crime}"  # Options: ucf-crime, xd-violence
 if [ "$DATASET" = "ucf-crime" ]; then
-    ANNO_PATH="${VIDEO_DIR}/raw_annotations/ucf_database_test_anno.txt"
+    ANNO_PATH="${ANNO_PATH:-${VIDEO_DIR}/raw_annotations/ucf_database_test_anno.txt}"
 else
-    ANNO_PATH="${VIDEO_DIR}/raw_annotations/xd_database_test_anno.txt"
+    ANNO_PATH="${ANNO_PATH:-${VIDEO_DIR}/raw_annotations/xd_database_test_anno.txt}"
 fi
 
 # Output path
@@ -91,7 +91,7 @@ PALIGEMMA_ATTN="sdpa"
 # StreamForest settings  
 STREAMFOREST_CONV_TEMPLATE="qwen_2"
 STREAMFOREST_TIME_MSG="short_online_v2"
-STREAMFOREST_QUANTIZATION="none"
+STREAMFOREST_QUANTIZATION="${STREAMFOREST_QUANTIZATION:-4bit}"
 
 # ==========================================
 # 4. Trigger Configuration
