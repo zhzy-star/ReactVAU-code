@@ -8,8 +8,7 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-# ReactVAU HIVAU finetuning on a single RTX 4090.
-# Local non-SLURM version of scripts/sbatch/train_reactvau_hivau_4090.sh.
+# ReactVAU HIVAU finetuning. Supports one or more local GPUs.
 
 set -eo pipefail
 
@@ -27,21 +26,35 @@ export PYTHONPATH="$PROJECT_ROOT"
 
 reactvau_activate_conda
 
-export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
-export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export TOKENIZERS_PARALLELISM=false
 export CUDA_LAUNCH_BLOCKING=0
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-export BNB_CUDA_VERSION=121
+VISIBLE_GPU_COUNT="$(awk -F',' '{print NF}' <<< "${CUDA_VISIBLE_DEVICES}")"
+GPU_COUNT="${NUM_GPUS:-${VISIBLE_GPU_COUNT}}"
+if ! [[ "${GPU_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NUM_GPUS must be a positive integer (got: ${GPU_COUNT})"
+    exit 1
+fi
+if [ "${GPU_COUNT}" -gt "${VISIBLE_GPU_COUNT}" ]; then
+    echo "ERROR: NUM_GPUS=${GPU_COUNT}, but only ${VISIBLE_GPU_COUNT} device(s) are listed in CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    exit 1
+fi
 export BITSANDBYTES_NOWELCOME=1
 
-export RANK=0
-export LOCAL_RANK=0
-export WORLD_SIZE=1
-export LOCAL_WORLD_SIZE=1
+# torchrun supplies rank variables for distributed runs. Avoid stale values
+# from a previous shell; provide the single-process values explicitly below.
+unset RANK LOCAL_RANK WORLD_SIZE LOCAL_WORLD_SIZE
 export MASTER_ADDR=localhost
 export MASTER_PORT=${MASTER_PORT:-29500}
+if [ "${GPU_COUNT}" -eq 1 ]; then
+    export RANK=0
+    export LOCAL_RANK=0
+    export WORLD_SIZE=1
+    export LOCAL_WORLD_SIZE=1
+fi
 
 # ==========================================
 # 2. Model, Data, and Output
@@ -62,6 +75,7 @@ MM_PROJECTOR_TYPE="${MM_PROJECTOR_TYPE:-tome729_fstw_pemf}"
 PROMPT_VERSION="${PROMPT_VERSION:-qwen_2}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
 MAX_STEPS="${MAX_STEPS:--1}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
 MID_RUN_NAME="${MID_RUN_NAME:-hivau_ft_4090_qlora_$(date +"%Y%m%d_%H%M%S")}"
 OUTPUT_DIR="${OUTPUT_DIR:-ckpt/hivau-finetune/${MID_RUN_NAME}}"
 mkdir -p "${OUTPUT_DIR}/runs"
@@ -83,7 +97,7 @@ EOF
 # 3. Pre-flight Checks
 # ==========================================
 echo "=========================================="
-echo "ReactVAU HIVAU Finetune (RTX 4090, 4-bit QLoRA)"
+echo "ReactVAU HIVAU Finetune (${GPU_COUNT} GPU(s), 4-bit QLoRA)"
 echo "=========================================="
 echo "Date: $(date)"
 echo "Project: $PROJECT_ROOT"
@@ -119,7 +133,13 @@ echo ""
 # 4. Run Training
 # ==========================================
 set +e
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} python -u llava/train/train_mem.py \
+if [ "${GPU_COUNT}" -gt 1 ]; then
+    LAUNCHER=(torchrun --standalone --nproc_per_node="${GPU_COUNT}" llava/train/train_mem.py)
+else
+    LAUNCHER=(python -u llava/train/train_mem.py)
+fi
+
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} "${LAUNCHER[@]}" \
     --deepspeed scripts/deepspeed/zero1.json \
     --model_name_or_path ${LLM_VERSION} \
     --version ${PROMPT_VERSION} \
@@ -151,7 +171,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} python -u llava/train/train_mem.py 
     --max_steps "${MAX_STEPS}" \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 500 \

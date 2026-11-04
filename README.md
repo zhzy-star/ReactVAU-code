@@ -259,9 +259,16 @@ source scripts/config/paths.sh
 python scripts/precompute/precompute_pg_scores.py --resume
 ```
 
-To use two GPUs, launch one worker per GPU. Each worker loads its own scorer,
-processes a disjoint shard of videos, and rank 0 merges the shards into the
-same `PG_SCORES_PATH` JSON format:
+When two or more GPUs are visible, the regular Python command above
+automatically starts two workers. Each worker loads its own scorer, processes a
+disjoint shard of videos, and rank 0 merges the shards into the same
+`PG_SCORES_PATH` JSON format. Use `--num-gpus 1` to force single-GPU mode.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python scripts/precompute/precompute_pg_scores.py --resume
+```
+
+The equivalent explicit launcher is:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
@@ -284,6 +291,17 @@ Use a stable output path so evaluation can reference the locally trained adapter
 
 ```bash
 source scripts/config/paths.sh
+MID_RUN_NAME=reactvau-hivau \
+OUTPUT_DIR="${CKPT_ROOT}/hivau-finetune/reactvau-hivau" \
+  bash scripts/train/finetune-hivau/finetune_reactvau.sh
+```
+
+The script uses one GPU by default. To train with two GPUs, set both the
+visible devices and `NUM_GPUS`; it starts one distributed training process per
+GPU and DeepSpeed synchronizes their gradients:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 NUM_GPUS=2 \
 MID_RUN_NAME=reactvau-hivau \
 OUTPUT_DIR="${CKPT_ROOT}/hivau-finetune/reactvau-hivau" \
   bash scripts/train/finetune-hivau/finetune_reactvau.sh

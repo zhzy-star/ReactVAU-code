@@ -392,7 +392,9 @@ class LlavaMetaForCausalLM(ABC):
     def encode_image_video_memory_batch(self, images_list, video_idx_in_batch, pg_scores=None):
         assert len(video_idx_in_batch)<2, "<<<encode_image_video_memory>>> i dont want to process multiple image or video"
         # print("images_list shape: ", images_list[0].shape)
-        batch_size = 32
+        # Keep the frozen SigLIP forward small enough to leave headroom for the
+        # language-model activations on 24 GB training GPUs.
+        batch_size = 12
         concat_images = torch.cat([image for image in images_list], dim=0)
         split_sizes = [image.shape[0] for image in images_list]
 

@@ -34,7 +34,10 @@ export CKPT_ROOT="${CKPT_ROOT:-${REACTVAU_ROOT}/ckpt}"
 # Runtime environment.
 export CONDA_ENV="${CONDA_ENV:-ReactVAU}"
 export CONDA_BASE="${CONDA_BASE:-${HOME}/miniconda3}"
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.1}"
+CUDA_ENV_ROOT="${CONDA_BASE}/envs/${CONDA_ENV}"
+export CUDA_HOME="${CUDA_HOME:-${CUDA_ENV_ROOT}/targets/x86_64-linux}"
+export PATH="${CUDA_ENV_ROOT}/nvvm/bin:${CUDA_HOME}/bin:${CUDA_ENV_ROOT}/bin:${PATH}"
+export CPATH="${CUDA_HOME}/include/cccl${CPATH:+:${CPATH}}"
 
 # Dataset roots. Set HIVAU_ROOT to the folder that contains videos/,
 # instruction/, and raw_annotations/.

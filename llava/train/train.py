@@ -383,6 +383,7 @@ def preprocess_multimodal(sources: Sequence[str], data_args: DataArguments, msg=
 
     for source in sources:
         for sentence in source:
+            sentence["value"] = sentence["value"].replace("<video>", DEFAULT_IMAGE_TOKEN)
             # TODO maybe this should be changed for interleaved data?
             # if DEFAULT_IMAGE_TOKEN in sentence["value"] and not sentence["value"].startswith(DEFAULT_IMAGE_TOKEN):
             # only check for num_im=1
@@ -962,6 +963,7 @@ class LazySupervisedDataset(Dataset):
         else:
             raise NotImplementedError(i)
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        conversations = copy.deepcopy([sample["conversations"] for sample in sources])
 
         if "image" in sources[0]:
             image_file = self.list_data_dict[i]["image"]
@@ -976,8 +978,7 @@ class LazySupervisedDataset(Dataset):
                     image = [self.process_image(f) for f in image_file]
             else:
                 image = [self.process_image(image_file)]
-            # sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
-            sources = preprocess_multimodal([e["conversations"] for e in sources], self.data_args)
+            sources = preprocess_multimodal(conversations, self.data_args)
 
         elif "video" in sources[0]:
             video_file = self.list_data_dict[i]["video"]
@@ -999,16 +1000,20 @@ class LazySupervisedDataset(Dataset):
                     image = processor.preprocess(video, return_tensors="pt")["pixel_values"]
 
                 image = [(image, video[0].shape[0:2], "video")]
-                # sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args, msg=time_msg)
-                sources = preprocess_multimodal([e["conversations"] for e in sources], self.data_args, msg=time_msg)
+                marker_count = sum(message.get("value", "").count("<video>") for message in conversations[0])
+                if marker_count != 1:
+                    sample_id = self.list_data_dict[i].get("id", i)
+                    raise ValueError(
+                        f"Video sample {sample_id} must contain exactly one <video> marker; found {marker_count}"
+                    )
+                sources = preprocess_multimodal(conversations, self.data_args, msg=time_msg)
 
             except Exception as e:
                 print(f"Error: {e}")
                 print(f"Failed to read video file: {video_file}")
                 raise e
         else:
-            # sources = copy.deepcopy([e["conversations"] for e in sources])
-            sources = [e["conversations"] for e in sources]
+            sources = conversations
 
         has_image = ("image" in self.list_data_dict[i]) or ("video" in self.list_data_dict[i])
         data_dict = preprocess(sources, self.tokenizer, has_image=has_image)

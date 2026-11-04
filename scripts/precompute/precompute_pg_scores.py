@@ -43,6 +43,7 @@ import signal
 import logging
 import warnings
 import argparse
+import subprocess
 from pathlib import Path
 import queue
 import threading
@@ -321,6 +322,9 @@ def main():
     parser.add_argument("--target-fps", type=int, default=4)
     parser.add_argument("--query-interval", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--num-gpus", type=int, default=None,
+        help="GPU workers to use when launched with python (default: up to 2 visible GPUs)")
 
     # Output
     parser.add_argument("--output-path", type=str,
@@ -335,13 +339,35 @@ def main():
     args = parser.parse_args()
 
     # torchrun sets these variables when launching one worker per GPU. A plain
-    # `python` invocation remains a single-process, single-GPU run.
+    # `python` invocation automatically launches up to two workers below.
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
     if not torch.cuda.is_available():
         parser.error("CUDA is required for PaliGemma scoring")
+    visible_gpus = torch.cuda.device_count()
+    requested_gpus = (
+        args.num_gpus if args.num_gpus is not None
+        else (world_size if distributed else min(2, visible_gpus)))
+    if requested_gpus < 1:
+        parser.error("--num-gpus must be at least 1")
+    if requested_gpus > visible_gpus:
+        parser.error(
+            f"Requested {requested_gpus} GPU workers, but only {visible_gpus} CUDA device(s) are visible")
+    if not distributed and requested_gpus > 1:
+        logging.info(
+            f"Launching {requested_gpus} workers on {requested_gpus} visible GPUs")
+        command = [
+            sys.executable, "-m", "torch.distributed.run", "--standalone",
+            f"--nproc_per_node={requested_gpus}", str(Path(__file__).resolve()),
+            *sys.argv[1:],
+        ]
+        completed = subprocess.run(command, check=False)
+        raise SystemExit(completed.returncode)
+    if distributed and requested_gpus != world_size:
+        parser.error(
+            f"torchrun started {world_size} worker(s), but --num-gpus={requested_gpus}")
     if local_rank >= torch.cuda.device_count():
         parser.error(
             f"LOCAL_RANK={local_rank}, but only {torch.cuda.device_count()} CUDA device(s) are visible")
@@ -352,6 +378,10 @@ def main():
 
     def log_info(message):
         logging.info(f"[rank {rank}] {message}" if distributed else message)
+
+    log_info(
+        f"Using GPU {local_rank} ({torch.cuda.get_device_name(local_rank)}); "
+        f"workers={world_size}")
 
     if not args.anno_path:
         parser.error(
@@ -575,6 +605,9 @@ def main():
     # Save each shard, then let rank 0 publish the merged output.
     if distributed:
         save_json_atomic(rank_result_path, rank_results)
+        gathered_failures = [None] * world_size
+        dist.all_gather_object(gathered_failures, failed)
+        all_failed = [entry for shard in gathered_failures for entry in shard]
         dist.barrier()
         if rank == 0:
             merged_results = dict(existing_results)
@@ -584,6 +617,9 @@ def main():
                     with open(worker_path) as f:
                         merged_results.update(json.load(f))
             save_json_atomic(args.output_path, merged_results)
+            if all_failed:
+                failed_path = args.output_path.replace('.json', '_failed.json')
+                save_json_atomic(failed_path, all_failed)
             for worker_rank in range(world_size):
                 worker_path = f"{args.output_path}.rank-{worker_rank}.json"
                 if os.path.exists(worker_path):
@@ -592,6 +628,7 @@ def main():
         dist.destroy_process_group()
         if rank == 0:
             results = merged_results
+        failed = all_failed
     else:
         save_json_atomic(args.output_path, results)
 
@@ -605,9 +642,10 @@ def main():
 
     if failed:
         failed_path = args.output_path.replace('.json', '_failed.json')
-        if not distributed or rank == 0:
+        if not distributed:
             save_json_atomic(failed_path, failed)
-        log_info(f"  Failed list: {failed_path}")
+        if not distributed or rank == 0:
+            log_info(f"  Failed list: {failed_path}")
 
 
 if __name__ == "__main__":

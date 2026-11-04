@@ -565,7 +565,16 @@ class SigLipVisionTower(nn.Module):
             rank0_print("{} is already loaded, `load_model` called again, skipping.".format(self.vision_tower_name))
             return
 
-        self.vision_tower = SigLipVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        if os.path.isdir(self.vision_tower_name):
+            self.vision_tower = SigLipVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        elif os.path.isabs(self.vision_tower_name):
+            rank0_print(
+                "SigLIP directory not found at {}. Building the local 384px "
+                "architecture; the parent checkpoint must provide its weights.".format(self.vision_tower_name)
+            )
+            self.vision_tower = SigLipVisionModel(SigLipVisionConfig())
+        else:
+            self.vision_tower = SigLipVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
 
         del self.vision_tower.vision_model.encoder.layers[-1:]
         self.vision_tower.vision_model.head = nn.Identity()
