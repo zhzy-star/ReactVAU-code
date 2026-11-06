@@ -14,6 +14,7 @@
 
 
 import os
+import json
 import warnings
 import shutil
 
@@ -97,7 +98,50 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             elif "qwen" in model_name.lower() or "quyen" in model_name.lower() or "qwen" in model_base.lower():
                 from llava.model.language_model.llava_qwen import LlavaQwenConfig
 
-                lora_cfg_pretrained = LlavaQwenConfig.from_pretrained(model_base)
+                qwen_config = AutoConfig.from_pretrained(model_base)
+                qwen_config_dict = qwen_config.to_dict()
+                vision_tower_path = qwen_config_dict.get("mm_vision_tower")
+                if (
+                    isinstance(vision_tower_path, str)
+                    and os.path.isabs(vision_tower_path)
+                    and not os.path.isdir(vision_tower_path)
+                    and os.path.isdir(model_base)
+                ):
+                    index_path = os.path.join(model_base, "model.safetensors.index.json")
+                    if not os.path.isfile(index_path):
+                        raise FileNotFoundError(
+                            "StreamForest config points to a missing SigLIP directory and "
+                            f"the local base has no safetensors index: {index_path}"
+                        )
+                    with open(index_path, "r", encoding="utf-8") as index_file:
+                        weight_map = json.load(index_file).get("weight_map", {})
+
+                    vision_prefix = "model.vision_tower.vision_tower.vision_model."
+                    vision_layers = {
+                        int(key.split(".encoder.layers.", 1)[1].split(".", 1)[0])
+                        for key in weight_map
+                        if key.startswith(vision_prefix) and ".encoder.layers." in key
+                    }
+                    required_vision_weights = {
+                        vision_prefix + "embeddings.patch_embedding.weight",
+                        vision_prefix + "embeddings.position_embedding.weight",
+                    }
+                    if not required_vision_weights.issubset(weight_map) or not set(range(26)).issubset(vision_layers):
+                        raise FileNotFoundError(
+                            "StreamForest config points to a missing SigLIP directory, and the "
+                            "local base checkpoint does not contain the complete 384px SigLIP "
+                            f"weights (found encoder layers {sorted(vision_layers)})."
+                        )
+
+                    qwen_config_dict["mm_vision_tower"] = (
+                        "checkpoint_embedded://siglip-so400m-patch14-384"
+                    )
+                    rank0_print(
+                        "Using the SigLIP architecture and weights embedded in the local "
+                        "StreamForest checkpoint."
+                    )
+                qwen_config_dict["model_type"] = LlavaQwenConfig.model_type
+                lora_cfg_pretrained = LlavaQwenConfig.from_dict(qwen_config_dict)
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
             else:
@@ -463,7 +507,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         vision_tower = model.get_vision_tower()
         if not vision_tower.is_loaded:
             vision_tower.load_model(device_map=device_map)
-        if device_map != "auto":
+        if device_map not in ("auto", "balanced", "balanced_low_0", "sequential"):
             vision_tower.to(device="cuda", dtype=torch.float16)
         image_processor = vision_tower.image_processor
 

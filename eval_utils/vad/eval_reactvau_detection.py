@@ -63,22 +63,20 @@ from tqdm import tqdm
 from PIL import Image
 import PIL.Image
 import numpy as np
-import traceback
 import warnings
 import logging
 import datetime
 import time
 import random
 import argparse
-import torch.nn.functional as F
 import torch
+import torch.nn.functional as F
 import json
 import cv2
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
-
 
 # ===================== Grid Image Creation (same as eval_paligemma) =====================
 GRID_SIZE = (2, 2)
@@ -296,6 +294,7 @@ class StreamForestReasoner:
         model_base: str = None,
         conv_template: str = "qwen_2",
         device: str = "cuda:0",
+        device_map: str = "balanced",
         time_msg_style: str = "short_online_v2",
         load_4bit: bool = False,
         load_8bit: bool = False,
@@ -320,7 +319,7 @@ class StreamForestReasoner:
             model_path,
             model_base=model_base,
             model_name=model_name,
-            device_map=device,
+            device_map=device_map,
             multimodal=True,
             load_4bit=load_4bit,
             load_8bit=load_8bit,
@@ -330,6 +329,27 @@ class StreamForestReasoner:
 
         self.vision_tower = self.model.get_vision_tower()
         self.mm_projector = self.model.get_model().mm_projector
+        self.device = self.model.get_input_embeddings().weight.device
+        self.mm_projector_device = next(self.mm_projector.parameters()).device
+        actual_device_map = getattr(self.model, "hf_device_map", {})
+        mapped_cuda_devices = set()
+        for mapped_device in actual_device_map.values():
+            if isinstance(mapped_device, int):
+                mapped_cuda_devices.add(mapped_device)
+            elif str(mapped_device).startswith("cuda:"):
+                mapped_cuda_devices.add(int(str(mapped_device).split(":", 1)[1]))
+        if not {0, 1}.issubset(mapped_cuda_devices):
+            raise RuntimeError(
+                "StreamForest was not sharded across both visible GPUs. "
+                f"device_map={actual_device_map}"
+            )
+        logging.info("[StreamForest] device map: %s", actual_device_map)
+        logging.info(
+            "[StreamForest] vision=%s projector=%s language_input=%s",
+            self.vision_tower.device,
+            self.mm_projector_device,
+            self.device,
+        )
 
         # Yes/No token IDs (both capitalized and lowercase for CoT generation parsing)
         self.positive_token_id = self._get_token_id("Yes")
@@ -362,15 +382,12 @@ class StreamForestReasoner:
         with torch.inference_mode():
             frame_tensor = self.image_processor.preprocess(
                 [pil_frame], return_tensors="pt"
-            )["pixel_values"].to(dtype=self.model.dtype, device=self.device)
+            )["pixel_values"].to(dtype=self.model.dtype, device=self.vision_tower.device)
             frame_features = self.vision_tower(frame_tensor)
             return frame_features[0]  # [H*W, C]
 
     def encode_frames_batch(self, pil_frames: list) -> torch.Tensor:
         """Encode multiple frames in a single batch forward pass through the vision tower.
-        
-        More efficient than calling encode_frame() in a loop since it utilizes
-        GPU parallelism by processing all frames in one kernel launch.
         
         Args:
             pil_frames: list of PIL.Image.Image frames to encode
@@ -381,9 +398,16 @@ class StreamForestReasoner:
         with torch.inference_mode():
             batch_tensor = self.image_processor.preprocess(
                 pil_frames, return_tensors="pt"
-            )["pixel_values"].to(dtype=self.model.dtype, device=self.device)
-            batch_features = self.vision_tower(batch_tensor)  # [N, H*W, C]
-            return batch_features
+            )["pixel_values"].to(dtype=self.model.dtype, device=self.vision_tower.device)
+            return self.vision_tower(batch_tensor)  # [N, H*W, C]
+
+    def _project_memory_tokens(self, memory_manager, rt_anomaly_tokens=None):
+        if rt_anomaly_tokens is not None:
+            rt_anomaly_tokens = rt_anomaly_tokens.to(self.device)
+        memory_tokens = memory_manager.get_memory_tokens(
+            rt_anomaly_tokens=rt_anomaly_tokens
+        ).to(self.mm_projector_device)
+        return self.mm_projector.mlp(memory_tokens).to(self.device)
 
     def get_anomaly_score_from_logits(
         self,
@@ -403,10 +427,8 @@ class StreamForestReasoner:
                               When provided, replaces Now in the memory sequence.
         """
         with torch.inference_mode():
-            memory_tokens = memory_manager.get_memory_tokens(
-                rt_anomaly_tokens=rt_anomaly_tokens
-            )
-            visual_features = self.mm_projector.mlp(memory_tokens)
+            visual_features = self._project_memory_tokens(
+                memory_manager, rt_anomaly_tokens)
 
         # Build prompt
         conv = conv_templates[self.conv_template].copy()
@@ -445,7 +467,6 @@ class StreamForestReasoner:
                 use_cache=False,
                 return_dict=True,
             )
-
             last_hidden = outputs.last_hidden_state[:, -1:, :]
             last_logits = causal_model.lm_head(last_hidden)[0, -1, :]
             pos_logit = last_logits[self.positive_token_id].item()
@@ -479,10 +500,8 @@ class StreamForestReasoner:
                               When provided, replaces Now in the memory sequence.
         """
         with torch.inference_mode():
-            memory_tokens = memory_manager.get_memory_tokens(
-                rt_anomaly_tokens=rt_anomaly_tokens
-            )
-            visual_features = self.mm_projector.mlp(memory_tokens)
+            visual_features = self._project_memory_tokens(
+                memory_manager, rt_anomaly_tokens)
 
         # Build prompt (same as Yes/No method)
         conv = conv_templates[self.conv_template].copy()
@@ -564,10 +583,8 @@ class StreamForestReasoner:
                               When provided, replaces Now in the memory sequence.
         """
         with torch.inference_mode():
-            memory_tokens = memory_manager.get_memory_tokens(
-                rt_anomaly_tokens=rt_anomaly_tokens
-            )
-            visual_features = self.mm_projector.mlp(memory_tokens)
+            visual_features = self._project_memory_tokens(
+                memory_manager, rt_anomaly_tokens)
 
         conv = conv_templates[self.conv_template].copy()
         time_msg = self._generate_time_msg(current_time, sampled_count)
@@ -663,10 +680,8 @@ class StreamForestReasoner:
             - reasoning_text: Full generated CoT text for logging/debugging
         """
         with torch.inference_mode():
-            memory_tokens = memory_manager.get_memory_tokens(
-                rt_anomaly_tokens=rt_anomaly_tokens
-            )
-            visual_features = self.mm_projector.mlp(memory_tokens)
+            visual_features = self._project_memory_tokens(
+                memory_manager, rt_anomaly_tokens)
 
         # Build prompt (same structure as other methods)
         conv = conv_templates[self.conv_template].copy()
@@ -1053,7 +1068,7 @@ class CombinedAnomalyDetector:
                 # === RT-Anomaly: Dense encode all 4 frames (controlled by enable_rt_anomaly) ===
                 rt_anomaly_tokens = None
                 if self.enable_rt_anomaly:
-                    # Batch encode all frames in one GPU forward pass for efficiency
+                    # Batch encode all frames in one GPU forward pass.
                     rt_encode_start = time.time()
                     rt_anomaly_tokens = self.streamforest.encode_frames_batch(frame_group)  # [4, 729, C]
                     timing["rt_anomaly_encode_times"].append(time.time() - rt_encode_start)
@@ -1418,29 +1433,41 @@ def main():
         logging.info(f"Test mode: using {len(video_keys)} samples")
     logging.info(f"Total videos to process: {len(video_keys)}")
 
-    # Initialize models. On 24GB GPUs, load StreamForest first so the transient
-    # LoRA merge peak does not compete with PaliGemma already resident in VRAM.
+    # Shard StreamForest across the visible GPUs; keep PaliGemma on its configured device.
+    streamforest_device_map = os.environ.get("STREAMFOREST_DEVICE_MAP", "balanced")
+    paligemma_device = os.environ.get("PALIGEMMA_DEVICE", "cuda:1")
+    if torch.cuda.device_count() != 2:
+        raise RuntimeError(
+            "Dual-GPU StreamForest evaluation requires exactly two visible GPUs; "
+            f"found {torch.cuda.device_count()}. Set CUDA_VISIBLE_DEVICES to two GPU IDs."
+        )
+    logging.info("StreamForest device map: %s", streamforest_device_map)
+    logging.info("PaliGemma device: %s", paligemma_device)
+
     logging.info("Initializing StreamForest reasoner...")
     streamforest = StreamForestReasoner(
         model_path=args.streamforest_model_path,
         model_base=args.streamforest_model_base,
         conv_template=args.streamforest_conv_template,
         device="cuda:0",
+        device_map=streamforest_device_map,
         time_msg_style=args.streamforest_time_msg,
         load_4bit=(args.streamforest_quantization == "4bit"),
         load_8bit=(args.streamforest_quantization == "8bit"),
     )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        streamforest_device = str(streamforest.device)
         logging.info(
-            f"GPU memory after SF load: {torch.cuda.memory_allocated() / (1024 ** 2):.1f} MB allocated, "
-            f"{torch.cuda.memory_reserved() / (1024 ** 2):.1f} MB reserved")
+            f"GPU memory after SF load on language input device {streamforest_device}: "
+            f"{torch.cuda.memory_allocated(streamforest_device) / (1024 ** 2):.1f} MB allocated, "
+            f"{torch.cuda.memory_reserved(streamforest_device) / (1024 ** 2):.1f} MB reserved")
 
     logging.info("Initializing PaliGemma detector...")
     paligemma = PaliGemmaDetector(
         model_path=args.paligemma_model_path,
         lora_path=args.paligemma_lora_path,
-        device="cuda:0",
+        device=paligemma_device,
         attn_implementation=args.paligemma_attn,
         image_size=args.paligemma_image_size,
         streamforest_weights_path=args.paligemma_streamforest_weights,
@@ -1449,8 +1476,9 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         logging.info(
-            f"GPU memory after model load: {torch.cuda.memory_allocated() / (1024 ** 2):.1f} MB allocated, "
-            f"{torch.cuda.memory_reserved() / (1024 ** 2):.1f} MB reserved")
+            f"GPU memory after PaliGemma load on {paligemma_device}: "
+            f"{torch.cuda.memory_allocated(paligemma_device) / (1024 ** 2):.1f} MB allocated, "
+            f"{torch.cuda.memory_reserved(paligemma_device) / (1024 ** 2):.1f} MB reserved")
 
     # Combined pipeline
     detector = CombinedAnomalyDetector(
@@ -1579,9 +1607,8 @@ def main():
                 "trigger_details": result["trigger_details"][:10],
             }
 
-        except Exception as e:
-            logging.error(f"Error processing {video_key}: {e}")
-            traceback.print_exc()
+        except Exception:
+            logging.exception("Error processing %s", video_key)
 
     elapsed_time = time.time() - start_time
 

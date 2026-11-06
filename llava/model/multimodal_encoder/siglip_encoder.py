@@ -565,7 +565,13 @@ class SigLipVisionTower(nn.Module):
             rank0_print("{} is already loaded, `load_model` called again, skipping.".format(self.vision_tower_name))
             return
 
-        if os.path.isdir(self.vision_tower_name):
+        if self.vision_tower_name == "checkpoint_embedded://siglip-so400m-patch14-384":
+            rank0_print(
+                "Initializing the 384px SigLIP architecture; its trained weights are "
+                "embedded in the parent StreamForest checkpoint."
+            )
+            self.vision_tower = SigLipVisionModel(SigLipVisionConfig())
+        elif os.path.isdir(self.vision_tower_name):
             self.vision_tower = SigLipVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
         elif os.path.isabs(self.vision_tower_name):
             rank0_print(

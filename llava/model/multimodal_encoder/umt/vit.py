@@ -6,9 +6,9 @@ import torch.utils.checkpoint as checkpoint
 from functools import partial
 try:
     from flash_attn import flash_attn_qkvpacked_func
-except:
-    print("You need to install flash_attn")
-from timm.models.layers import drop_path, to_2tuple, trunc_normal_
+except ImportError:
+    flash_attn_qkvpacked_func = None
+from timm.layers import drop_path, to_2tuple, trunc_normal_
 
 # logger = logging.getLogger(__name__)
 
@@ -91,6 +91,10 @@ class Attention(nn.Module):
         qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
         
         if self.attn_type == 'flash_v2':
+            if flash_attn_qkvpacked_func is None:
+                raise ImportError(
+                    "UMT flash_v2 attention requires the optional flash_attn package"
+                )
             qkv = qkv.reshape(B, N, 3, self.num_heads, -1)
             x = flash_attn_qkvpacked_func(qkv, dropout_p=self.attn_drop, softmax_scale=self.scale, causal=False).reshape(B, N, -1)
         else:

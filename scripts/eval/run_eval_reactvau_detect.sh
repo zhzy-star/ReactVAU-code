@@ -8,7 +8,7 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-# ReactVAU Video Anomaly Detection Evaluation Script (Single GPU)
+# ReactVAU Video Anomaly Detection Evaluation Script (Dual GPU)
 # Combined PaliGemma + StreamForest Pipeline
 
 set -e
@@ -37,8 +37,10 @@ export PYTHONUNBUFFERED=1
 # Redirect stderr to stdout for unified logging
 exec 2>&1
 
-# Set CUDA device
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Shard StreamForest across two GPUs by default.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+export STREAMFOREST_DEVICE_MAP="${STREAMFOREST_DEVICE_MAP:-balanced}"
+export PALIGEMMA_DEVICE="${PALIGEMMA_DEVICE:-cuda:1}"
 
 # ==========================================
 # 2. Path Configuration
@@ -148,11 +150,12 @@ if [ "$PALIGEMMA_IMAGE_SIZE" -eq 384 ]; then
 fi
 
 echo "=========================================="
-echo "ReactVAU VAD Evaluation (Single GPU)"
+echo "ReactVAU VAD Evaluation (Dual GPU)"
 echo "=========================================="
 echo "Start Time: $(date)"
 echo ""
 echo "PaliGemma Model: $PALIGEMMA_MODEL_PATH"
+echo "PaliGemma Device: $PALIGEMMA_DEVICE"
 if [ -n "$PALIGEMMA_LORA_PATH" ] && [ -d "$PALIGEMMA_LORA_PATH" ]; then
     echo "PaliGemma LoRA: $PALIGEMMA_LORA_PATH"
     PG_LORA_FLAG="--paligemma-lora-path $PALIGEMMA_LORA_PATH"
@@ -170,6 +173,7 @@ else
 fi
 echo ""
 echo "StreamForest Model: $STREAMFOREST_MODEL_PATH"
+echo "StreamForest Device Map: $STREAMFOREST_DEVICE_MAP"
 if [ -n "$STREAMFOREST_MODEL_BASE" ]; then
     echo "StreamForest Base: $STREAMFOREST_MODEL_BASE"
     SF_BASE_FLAG="--streamforest-model-base $STREAMFOREST_MODEL_BASE"
