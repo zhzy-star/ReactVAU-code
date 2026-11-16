@@ -103,12 +103,22 @@ def verify_outputs(run_dir, world_size):
                      "train_history.csv", "eval_history.csv", "training.log",
                      *(f"training.rank{rank}.log" for rank in range(1, world_size))):
         assert (run_dir / filename).is_file(), filename
-    assert (run_dir / "checkpoint-1" / "adapter_model.safetensors").is_file()
+    assert (run_dir / "checkpoint-1" / "adapter_model.safetensors").is_file(), \
+        "First best adapter was not saved outside the periodic save interval"
     assert (run_dir / "checkpoint-2" / "adapter_model.safetensors").is_file()
     summary = json.loads((run_dir / "metrics_summary.json").read_text())
     assert len(summary["train_history"]) == 2, summary
     assert all(math.isfinite(entry["loss"]) for entry in summary["train_history"]), summary
     assert summary["best_model_checkpoint"], summary
+    from safetensors.torch import load_file
+    import torch
+    best = Path(summary["best_model_checkpoint"])
+    assert (best / "adapter_config.json").is_file(), best
+    best_weights = load_file(str(best / "adapter_model.safetensors"))
+    exported = load_file(str(run_dir / "adapter_model.safetensors"))
+    assert best_weights.keys() == exported.keys()
+    assert all(torch.equal(value, exported[key]) for key, value in best_weights.items()), \
+        "Final adapter does not match the selected best checkpoint"
     final_eval = summary["final_eval"]
     assert 0 <= final_eval["eval_auc"] <= 1
     assert 0 <= final_eval["eval_accuracy"] <= 1
@@ -116,6 +126,8 @@ def verify_outputs(run_dir, world_size):
     assert config["global_batch_size"] == 32
     assert config["training_args"]["per_device_train_batch_size"] == 2
     assert config["training_args"]["gradient_accumulation_steps"] == 32 // (world_size * 2)
+    assert config["training_args"]["save_steps"] == 2
+    assert config["training_args"]["eval_steps"] == 1
     return {"ranks": audits, "training": summary}
 
 
@@ -197,13 +209,15 @@ def main():
                                 "global_batch_size": 32}}
     from check_loss_normalization import run_checks
     report["loss_normalization"] = run_checks()
+    from check_checkpoint_lifecycle import run_checks as checkpoint_checks
+    report["checkpoint_lifecycle"] = checkpoint_checks()
     image_root = Path(os.environ.get("IMAGE_ROOT", os.environ.get(
         "VAD_TRAIN_ROOT", ROOT / "vad" / "vad_data" / "paligemma_train")))
     data_path = session / "smoke_data.json"
     report["data"] = prepare_data(data_path, image_root)
     env = dict(os.environ, DATA_PATH=str(data_path), IMAGE_ROOT=str(image_root),
                OUTPUT_DIR=str(session / "outputs"), NPROC_PER_NODE=str(world_size), BATCH_SIZE="2",
-               GRAD_ACCUM=str(grad_accum), MAX_STEPS="2", LOGGING_STEPS="1", SAVE_STEPS="1",
+               GRAD_ACCUM=str(grad_accum), MAX_STEPS="2", LOGGING_STEPS="1", SAVE_STEPS="2",
                EVAL_STEPS="1", SMOKE_AUDIT="True", DATALOADER_NUM_WORKERS="2",
                WARMUP_RATIO="0")
     report_path = session / "smoke_report.json"

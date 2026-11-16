@@ -45,6 +45,15 @@ class MainProcessHistory(stage1.MetricsHistoryCallback):
             return super().on_evaluate(args, state, control, metrics=metrics, **kwargs)
 
 
+class EvaluateFinalStep(TrainerCallback):
+    """Compare the final optimizer step before Trainer reloads the best model."""
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if args.load_best_model_at_end and state.global_step >= state.max_steps:
+            control.should_evaluate = True
+        return control
+
+
 class IndexedDataset(stage1.VADDataset):
     def __getitem__(self, idx):
         sample = super().__getitem__(idx)
@@ -55,9 +64,28 @@ class IndexedDataset(stage1.VADDataset):
 class DDPVADTrainer(stage1.VADTrainer):
     """Keep prefix-only evaluation; normalize loss over each accumulation window."""
 
+    def _determine_best_metric(self, metrics, trial):
+        is_new_best = super()._determine_best_metric(metrics, trial)
+        # Transformers 4.47.1 updates best_model_checkpoint on every evaluation,
+        # including steps outside save_steps. Schedule a full checkpoint on all
+        # ranks so the selected adapter exists and checkpoint rotation keeps it.
+        if is_new_best and self.args.load_best_model_at_end:
+            self.control.should_save = True
+        return is_new_best
+
     def _load_best_model(self):
         if not isinstance(self.model, PeftModel):
             return super()._load_best_model()
+        checkpoint = Path(self.state.best_model_checkpoint)
+        if not (checkpoint / "adapter_config.json").is_file() or not any(
+            (checkpoint / name).is_file()
+            for name in ("adapter_model.safetensors", "adapter_model.bin")
+        ):
+            raise FileNotFoundError(
+                f"Best adapter checkpoint is incomplete: {checkpoint}. "
+                "Expected adapter_config.json and adapter_model.safetensors "
+                "or adapter_model.bin. No alternative checkpoint was selected."
+            )
         # PEFT 0.14 infers the unindexed "cuda" device. safetensors resolves
         # that to GPU 0 even when another LOCAL_RANK is current. Read on CPU
         # and copy into the existing parameters on each rank's own GPU.
@@ -231,7 +259,7 @@ def train():
     trainer = DDPVADTrainer(
         model=model, args=args, train_dataset=datasets[0], eval_dataset=datasets[1],
         data_collator=stage1.VADDataCollator(), compute_metrics=stage1.compute_metrics,
-        callbacks=[history] + ([audit] if audit else []),
+        callbacks=[history, EvaluateFinalStep()] + ([audit] if audit else []),
         yes_token_id=processor.tokenizer.encode("Yes", add_special_tokens=False)[0],
         no_token_id=processor.tokenizer.encode("No", add_special_tokens=False)[0],
         label_format=data_args.label_format, decision_token_weight=args.decision_token_weight,
@@ -253,6 +281,7 @@ def train():
             "train_metrics": result.metrics, "final_eval": metrics,
             "train_history": history.train_history, "eval_history": history.eval_history,
             "best_model_checkpoint": trainer.state.best_model_checkpoint,
+            "best_metric": trainer.state.best_metric,
         }, indent=2))
     if audit:
         metadata.update(rank=args.process_index, train_indices=trainer.smoke_train_indices,
