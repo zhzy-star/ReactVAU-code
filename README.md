@@ -305,6 +305,12 @@ All evaluations below require the locally trained Stage-1 and Stage-2 outputs an
 
 Evaluate the Fast module independently on both VAD datasets:
 
+The launcher uses four GPUs (`CUDA_VISIBLE_DEVICES=0,1,2,3`, `NPROC_PER_NODE=4`)
+by default. Each GPU loads a complete model and processes a disjoint subset of
+videos. `BATCH_SIZE` is per GPU. Rank 0 merges all frame predictions and labels
+before computing ROC-AUC/PR-AUC/AP; metrics are not averaged across GPUs.
+For a single GPU, set `CUDA_VISIBLE_DEVICES=0 NPROC_PER_NODE=1` before the command.
+
 ```bash
 DATASET=ucf-crime TEST_MODE=true TEST_SAMPLES=10 \
   bash scripts/eval/run_eval_paligemma_detect.sh
@@ -323,7 +329,7 @@ DATASET=xd-violence TEST_MODE=false \
   bash scripts/eval/run_eval_paligemma_detect.sh
 ```
 
-Each run saves `detection.log`, `summary.json`, and `video_results.json` under a timestamped directory in `eval_results/vad/`. The summary reports raw, non-causal Gaussian-smoothed, and causal online-smoothed ROC-AUC/PR-AUC/AP. Use the causal online-smoothed result for the streaming setting.
+Each run saves `detection.log`, `summary.json`, and `video_results.json` under a timestamped directory in `eval_results/vad/`. Multi-GPU runs also save a log for each additional rank. The summary reports raw and non-causal Gaussian-smoothed ROC-AUC/PR-AUC/AP, along with `world_size`. Temporary prediction shards are removed after the final results are saved.
 
 ### Full ReactVAU streaming VAD
 

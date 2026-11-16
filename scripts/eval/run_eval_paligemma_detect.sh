@@ -8,8 +8,8 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-# PaliGemma Video Anomaly Detection Evaluation Script (single RTX 4090)
-# Local version aligned with scripts/sbatch/eval_paligemma_vad_sbatch.sh.
+# PaliGemma Video Anomaly Detection Evaluation (four GPUs by default).
+# Each process handles disjoint videos; rank 0 computes global frame metrics.
 
 set -e
 
@@ -30,7 +30,9 @@ export NVIDIA_TF32_OVERRIDE=1
 export BNB_CUDA_VERSION=121
 export BITSANDBYTES_NOWELCOME=1
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 exec 2>&1
 
 # ==========================================
@@ -66,6 +68,19 @@ METHOD="${METHOD:-logits}"  # logits or generate
 # PaliGemma-only eval can usually use a larger batch than the combined pipeline.
 BATCH_SIZE="${BATCH_SIZE:-16}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+if [[ ! "$NPROC_PER_NODE" =~ ^[1-9][0-9]*$ || ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NPROC_PER_NODE and BATCH_SIZE must be positive integers"
+    exit 1
+fi
+python - "$NPROC_PER_NODE" <<'PY'
+import sys
+import torch
+
+requested = int(sys.argv[1])
+available = torch.cuda.device_count()
+if not torch.cuda.is_available() or available < requested:
+    raise SystemExit(f"ERROR: Requested {requested} GPUs, but only {available} CUDA GPUs are visible")
+PY
 
 # ==========================================
 # 4. Test Mode Configuration
@@ -92,7 +107,7 @@ if [ "$IMAGE_SIZE" -eq 384 ]; then
 fi
 
 echo "=========================================="
-echo "PaliGemma VAD Streaming Evaluation (Binary, 4090)"
+echo "PaliGemma VAD Streaming Evaluation (Binary, ${NPROC_PER_NODE} GPUs)"
 echo "=========================================="
 echo "Start Time: $(date)"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
@@ -100,19 +115,19 @@ echo ""
 echo "Model: $MODEL_PATH"
 if [ -n "$LORA_PATH" ] && [ -d "$LORA_PATH" ]; then
     echo "LoRA: $LORA_PATH"
-    LORA_FLAG="--lora-path $LORA_PATH"
+    LORA_FLAGS=(--lora-path "$LORA_PATH")
 else
     echo "LoRA: None (using base model)"
-    LORA_FLAG=""
+    LORA_FLAGS=()
 fi
 
 echo "Image Size: ${IMAGE_SIZE}x${IMAGE_SIZE}"
 if [ "$IMAGE_SIZE" -eq 384 ]; then
     echo "StreamForest Weights: $STREAMFOREST_WEIGHTS"
     echo "Vision Feature Layer: $VISION_FEATURE_LAYER"
-    SF_VISION_FLAGS="--image-size 384 --streamforest-vision-weights-path $STREAMFOREST_WEIGHTS --vision-feature-layer $VISION_FEATURE_LAYER"
+    SF_VISION_FLAGS=(--image-size 384 --streamforest-vision-weights-path "$STREAMFOREST_WEIGHTS" --vision-feature-layer "$VISION_FEATURE_LAYER")
 else
-    SF_VISION_FLAGS="--image-size 448"
+    SF_VISION_FLAGS=(--image-size 448)
 fi
 
 echo ""
@@ -124,7 +139,8 @@ echo "Streaming Config:"
 echo "  Target FPS: $TARGET_FPS"
 echo "  Query Interval: $QUERY_INTERVAL"
 echo "  Method: $METHOD"
-echo "  Batch Size: $BATCH_SIZE"
+echo "  GPUs: $NPROC_PER_NODE (visible: $CUDA_VISIBLE_DEVICES)"
+echo "  Batch Size per GPU: $BATCH_SIZE"
 echo "  Attention: $ATTN_IMPLEMENTATION"
 echo ""
 echo "Output: $OUTPUT_PATH"
@@ -132,17 +148,21 @@ echo "=========================================="
 
 if [ "$TEST_MODE" = true ]; then
     echo "TEST MODE: Processing $TEST_SAMPLES random samples"
-    TEST_FLAGS="--test-mode --test-samples $TEST_SAMPLES"
+    TEST_FLAGS=(--test-mode --test-samples "$TEST_SAMPLES")
 else
     echo "FULL EVALUATION MODE"
-    TEST_FLAGS=""
+    TEST_FLAGS=()
 fi
 echo ""
 
-python "${PROJECT_ROOT}/eval_utils/vad/eval_paligemma_detection.py" \
+LAUNCHER=(python)
+if [ "$NPROC_PER_NODE" -gt 1 ]; then
+    LAUNCHER+=(-m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE")
+fi
+"${LAUNCHER[@]}" "${PROJECT_ROOT}/eval_utils/vad/eval_paligemma_detection.py" \
     --model-path "$MODEL_PATH" \
-    $LORA_FLAG \
-    $SF_VISION_FLAGS \
+    "${LORA_FLAGS[@]}" \
+    "${SF_VISION_FLAGS[@]}" \
     --target-fps "$TARGET_FPS" \
     --query-interval "$QUERY_INTERVAL" \
     --method "$METHOD" \
@@ -153,7 +173,7 @@ python "${PROJECT_ROOT}/eval_utils/vad/eval_paligemma_detection.py" \
     --anno-path "$ANNO_PATH" \
     --output-path "$OUTPUT_PATH" \
     --save-video-scores \
-    $TEST_FLAGS
+    "${TEST_FLAGS[@]}"
 
 echo ""
 echo "=========================================="

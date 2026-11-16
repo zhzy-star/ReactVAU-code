@@ -13,6 +13,7 @@ Supports:
 1. Fine-tuned model with 2x2 grid input (--use-grid)
 2. Single-frame baseline (default)
 3. LoRA adapter loading
+4. Multi-GPU video sharding via torchrun, with global frame-level metrics
 
 Streaming Evaluation:
 - 4 FPS sampling
@@ -31,8 +32,10 @@ import random
 import time
 import datetime
 import logging
+import shutil
 import warnings
 import numpy as np
+import torch.distributed as dist
 import PIL.Image
 from PIL import Image
 from tqdm import tqdm
@@ -847,6 +850,34 @@ class PaliGemmaAnomalyDetector:
         }
 
 
+def merge_rank_results(shard_dir, world_size):
+    """Merge frame predictions before computing any dataset-level metrics."""
+    score_parts, label_parts, smoothed_parts = [], [], []
+    video_results = {}
+    total_queries = total_segments = 0
+    for rank in range(world_size):
+        with np.load(os.path.join(shard_dir, f"rank-{rank}.npz")) as shard:
+            scores = shard["scores"]
+            labels = shard["labels"]
+            smoothed = shard["smoothed"]
+            if not (len(scores) == len(labels) == len(smoothed)):
+                raise ValueError(f"Mismatched frame arrays in rank {rank}")
+            score_parts.append(scores)
+            label_parts.append(labels)
+            smoothed_parts.append(smoothed)
+        with open(os.path.join(shard_dir, f"rank-{rank}.json")) as f:
+            metadata = json.load(f)
+        overlap = video_results.keys() & metadata["video_results"].keys()
+        if overlap:
+            raise ValueError(f"Videos processed by multiple ranks: {sorted(overlap)}")
+        video_results.update(metadata["video_results"])
+        total_queries += metadata["total_queries"]
+        total_segments += metadata["total_segments"]
+    return (np.concatenate(score_parts), np.concatenate(label_parts),
+            np.concatenate(smoothed_parts), video_results,
+            total_queries, total_segments)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="PaliGemma VAD Evaluation (Streaming)")
@@ -863,7 +894,7 @@ def main():
     parser.add_argument("--query-interval", type=int, default=4,
                         help="Frames per query (default: 4 for 1 query/sec)")
     parser.add_argument("--batch-size", type=int, default=1,
-                        help="Batch size for inference")
+                        help="Batch size for inference on each GPU")
     parser.add_argument("--method", type=str, default="logits", choices=["logits", "generate"],
                         help="Scoring method: logits (fast) or generate (accurate)")
 
@@ -904,13 +935,29 @@ def main():
 
     args = parser.parse_args()
 
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if not torch.cuda.is_available() or local_rank >= torch.cuda.device_count():
+        parser.error(f"Rank {rank} requires visible CUDA device {local_rank}; "
+                     f"found {torch.cuda.device_count()} visible GPU(s)")
+    torch.cuda.set_device(local_rank)
+    if world_size > 1:
+        # Only metadata and synchronization use collectives. Frame predictions
+        # are merged through local disk to avoid large object gathers on GPUs.
+        dist.init_process_group(backend="gloo", timeout=datetime.timedelta(hours=24))
+
     # Validate 384 mode args
     if args.image_size == 384 and not args.streamforest_vision_weights_path:
         parser.error(
             "--streamforest-vision-weights-path is required when --image-size is 384")
 
     # Create output directory
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    run_timestamp = [datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
+                     if rank == 0 else None]
+    if world_size > 1:
+        dist.broadcast_object_list(run_timestamp, src=0)
+    now_str = run_timestamp[0]
     lora_suffix = "lora" if args.lora_path else "base"
     output_dir = os.path.join(
         args.output_path,
@@ -923,7 +970,8 @@ def main():
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(os.path.join(output_dir, "detection.log")),
+            logging.FileHandler(os.path.join(
+                output_dir, "detection.log" if rank == 0 else f"detection_rank{rank}.log")),
             logging.StreamHandler()
         ]
     )
@@ -939,6 +987,7 @@ def main():
     logging.info(f"Query Interval: {args.query_interval}")
     logging.info(f"Method: {args.method}")
     logging.info(f"Batch Size: {args.batch_size}")
+    logging.info(f"Rank: {rank}/{world_size}, CUDA device: {local_rank}")
     logging.info(f"Image Size: {args.image_size}x{args.image_size}")
     if args.streamforest_vision_weights_path:
         logging.info(
@@ -954,7 +1003,9 @@ def main():
                                 video_dir=args.video_dir)
 
     # Filter samples
-    video_keys = list(annotations.keys())
+    # Stable ordering is essential: filesystem discovery order can differ
+    # between processes, particularly for XD-Violence normal videos.
+    video_keys = sorted(annotations.keys())
     if args.test_mode:
         random.seed(42)
         video_keys = random.sample(video_keys, min(
@@ -962,18 +1013,22 @@ def main():
         logging.info(f"Test mode: using {len(video_keys)} samples")
 
     logging.info(f"Total videos to process: {len(video_keys)}")
+    video_keys = video_keys[rank::world_size]
+    logging.info(f"Videos assigned to rank {rank}: {len(video_keys)}")
 
     # Initialize detector
     logging.info("Initializing PaliGemma detector...")
     detector = PaliGemmaAnomalyDetector(
         model_path=args.model_path,
         lora_path=args.lora_path,
-        device="cuda:0",
+        device=f"cuda:{local_rank}",
         attn_implementation=args.attn_implementation,
         image_size=args.image_size,
         streamforest_weights_path=args.streamforest_vision_weights_path,
         vision_feature_layer=args.vision_feature_layer,
-    )
+    ) if video_keys else None
+    if world_size > 1:
+        dist.barrier()
 
     # Determine video path format
     if args.dataset == "ucf-crime":
@@ -993,7 +1048,7 @@ def main():
 
     start_time = time.time()
 
-    pbar = tqdm(video_keys, desc="Processing videos", dynamic_ncols=True)
+    pbar = tqdm(video_keys, desc=f"Rank {rank}: Processing videos", dynamic_ncols=True)
     for video_key in pbar:
         pbar.set_postfix({"video": video_key[:30]}, refresh=True)
 
@@ -1061,6 +1116,27 @@ def main():
             import traceback
             traceback.print_exc()
 
+    if world_size > 1:
+        shard_dir = os.path.join(output_dir, "_shards")
+        os.makedirs(shard_dir, exist_ok=True)
+        np.savez(os.path.join(shard_dir, f"rank-{rank}.npz"),
+                 scores=np.asarray(all_frame_scores, dtype=np.float64),
+                 labels=np.asarray(all_frame_labels, dtype=np.uint8),
+                 smoothed=np.asarray(all_smoothed_scores, dtype=np.float64))
+        with open(os.path.join(shard_dir, f"rank-{rank}.json"), "w") as f:
+            json.dump({"video_results": video_results,
+                       "total_queries": total_queries,
+                       "total_segments": total_segments}, f)
+        logging.info(f"Rank {rank} finished {len(video_results)} videos; waiting for other ranks")
+        del all_frame_scores, all_frame_labels, all_smoothed_scores, video_results
+        dist.barrier()
+        dist.destroy_process_group()
+        if rank != 0:
+            return
+        (all_frame_scores, all_frame_labels, all_smoothed_scores,
+         video_results, total_queries, total_segments) = merge_rank_results(shard_dir, world_size)
+        logging.info(f"Merged predictions from all {world_size} GPUs")
+
     elapsed_time = time.time() - start_time
 
     # Compute metrics
@@ -1111,6 +1187,7 @@ def main():
         "query_interval": args.query_interval,
         "method": args.method,
         "batch_size": args.batch_size,
+        "world_size": world_size,
         "num_videos": len(video_results),
         "total_queries": total_queries,
         "total_segments": total_segments,
@@ -1129,9 +1206,16 @@ def main():
         with open(os.path.join(output_dir, "video_results.json"), 'w') as f:
             json.dump(video_results, f, indent=2)
 
+    if world_size > 1:
+        shutil.rmtree(shard_dir)
+
     logging.info(f"\n✅ Results saved to {output_dir}")
     logging.info("=" * 60)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
