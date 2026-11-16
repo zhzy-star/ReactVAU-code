@@ -28,3 +28,4 @@ scripts/train/finetune-hivau/hivau_minimal.json
 ablation
 baseline
 precomputed
+docs/bash_learning_guide_zh.md
