@@ -18,7 +18,10 @@ that the training DataLoader can load at fine-tuning time.
 This ensures training-time PG context matches eval-time exactly.
 
 Usage:
-    python precompute_pg_scores.py
+    python scripts/precompute/precompute_pg_scores.py --resume
+    # Defaults to two workers on GPU pairs (0, 1) and (2, 3), batch 32 per pair.
+    python scripts/precompute/precompute_pg_scores.py --resume --num-gpus 4 --gpus-per-worker 2
+    python scripts/precompute/precompute_pg_scores.py --resume --num-gpus 1 --gpus-per-worker 1
 
 Output:
     {output_path}/pg_scores_hivau_train.json
@@ -36,7 +39,7 @@ Output:
 import os
 import sys
 import json
-import math
+import multiprocessing as mp
 import time
 import signal
 import logging
@@ -44,7 +47,7 @@ import warnings
 import argparse
 from pathlib import Path
 import queue
-import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 
@@ -114,6 +117,7 @@ def create_grid_image(frames, grid_size=(2, 2), image_size=448):
 # ===================== Vision Encoder Utilities =====================
 from safetensors.torch import load_file as safetensors_load_file
 from peft import PeftModel
+from accelerate import dispatch_model
 from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
 import types
 
@@ -192,16 +196,23 @@ class PaliGemmaScorer:
 
     def __init__(self, model_path, lora_path, device="cuda:0",
                  image_size=384, streamforest_weights_path=None,
-                 vision_feature_layer=-2, attn_implementation="sdpa"):
+                 vision_feature_layer=-2, attn_implementation="sdpa", gpu_ids=None):
         self.device = torch.device(device)
+        self.gpu_ids = list(gpu_ids) if gpu_ids is not None else [self.device.index]
         self.torch_dtype = torch.bfloat16
         self.image_size = image_size
+        self._logged_batch = False
 
         logging.info(f"[PaliGemma] Loading model from {model_path}...")
         self.processor = AutoProcessor.from_pretrained(model_path)
+        # Keep the scoring position at -1 even if padding is needed.
+        self.processor.tokenizer.padding_side = "left"
+        # Replace vision weights and merge the adapter before attaching dispatch hooks.
+        # This also avoids loading a complete replica onto either GPU of a pair.
         self.model = PaliGemmaForConditionalGeneration.from_pretrained(
             model_path, torch_dtype=self.torch_dtype,
-            device_map=device, attn_implementation=attn_implementation)
+            device_map="cpu" if len(self.gpu_ids) > 1 else device,
+            attn_implementation=attn_implementation)
 
         if image_size == 384 and streamforest_weights_path:
             self.model = load_streamforest_vision_weights(
@@ -221,6 +232,29 @@ class PaliGemmaScorer:
         if image_size == 384 and streamforest_weights_path and vision_feature_layer != -1:
             self.model = patch_vision_feature_layer(
                 self.model, select_layer=vision_feature_layer)
+
+        if len(self.gpu_ids) == 2:
+            first, second = self.gpu_ids
+            num_layers = len(self.model.language_model.model.layers)
+            split = num_layers // 2
+            device_map = {
+                "vision_tower": first,
+                "multi_modal_projector": first,
+                "language_model.model.embed_tokens": first,
+                "language_model.model.norm": second,
+                # The output head shares its weights with the input embedding.
+                "language_model.lm_head": first,
+            }
+            device_map.update({
+                f"language_model.model.layers.{index}": first if index < split else second
+                for index in range(num_layers)
+            })
+            self.model = dispatch_model(self.model, device_map=device_map,
+                                        main_device=first)
+            logging.info(
+                "[PaliGemma] GPU pair %s: vision + embedding + layers 0-%d on GPU %d; "
+                "layers %d-%d + norm on GPU %d; tied output head on GPU %d",
+                self.gpu_ids, split - 1, first, split, num_layers - 1, second, first)
 
         self.model.eval()
 
@@ -243,6 +277,12 @@ class PaliGemmaScorer:
         for batch_start in range(0, len(grid_images), batch_size):
             batch_end = min(batch_start + batch_size, len(grid_images))
             batch_imgs = grid_images[batch_start:batch_end]
+            real_batch_size = len(batch_imgs)
+            # Keep every forward at the configured batch size, including tails.
+            # BF16 GEMM kernels can otherwise vary with the tail's batch shape.
+            # Duplicate images do not interact with real samples in evaluation.
+            if real_batch_size < batch_size:
+                batch_imgs = batch_imgs + [batch_imgs[-1]] * (batch_size - real_batch_size)
             prompts = [full_prompt] * len(batch_imgs)
             inputs = self.processor(
                 text=prompts, images=batch_imgs,
@@ -254,12 +294,16 @@ class PaliGemmaScorer:
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
                     pixel_values=inputs["pixel_values"],
+                    num_logits_to_keep=1,
+                    use_cache=False,
                 )
                 logits = outputs.logits
-                for idx in range(len(batch_imgs)):
-                    attention = inputs["attention_mask"][idx]
-                    last_pos = attention.sum().item() - 1
-                    last_logits = logits[idx, last_pos]
+                if not self._logged_batch:
+                    logging.info("[PaliGemma] GPUs %s: first inference batch=%d, logits=%s",
+                                 self.gpu_ids, len(batch_imgs), tuple(logits.shape))
+                    self._logged_batch = True
+                for idx in range(real_batch_size):
+                    last_logits = logits[idx, -1]
                     yes_logit = max(
                         last_logits[self.yes_token_id].float(),
                         last_logits[self.yes_lower_token_id].float())
@@ -272,7 +316,8 @@ class PaliGemmaScorer:
         return all_scores
 
 
-def read_video_grids(video_path, image_size, target_fps=4, query_interval=4):
+def read_video_grids(video_path, image_size, target_fps=4, query_interval=4,
+                     stop_event=None):
     """Read video frames and create grid images. CPU-bound, safe to run in thread."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -294,6 +339,9 @@ def read_video_grids(video_path, image_size, target_fps=4, query_interval=4):
     current_frame_pos = 0
 
     while sampled_idx < num_sampled_frames:
+        if stop_event is not None and stop_event.is_set():
+            cap.release()
+            return None, None
         target_frame = min(sampled_idx * sample_interval, total_frames - 1)
 
         # Skip forward sequentially (grab without decode)
@@ -329,6 +377,246 @@ def read_video_grids(video_path, image_size, target_fps=4, query_interval=4):
     }
     del query_frame_groups
     return grid_images, metadata
+
+
+def save_json_atomic(path, data):
+    """Only the parent writes checkpoints; replace after a complete JSON write."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(path.name + ".tmp")
+    with temporary_path.open("w") as f:
+        json.dump(data, f)
+    os.replace(temporary_path, path)
+
+
+def score_video_shard(rank, videos, args, pg_prompt, result_queue, stop_event):
+    """Run one model replica per GPU group and report completed videos to parent."""
+    # Spawn gives each worker a fresh CUDA context. The parent handles shutdown.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, lambda signum, frame: stop_event.set())
+    signal.signal(signal.SIGUSR1, lambda signum, frame: stop_event.set())
+    try:
+        if stop_event.is_set():
+            return
+        gpu_ids = list(range(rank * args.gpus_per_worker,
+                             (rank + 1) * args.gpus_per_worker))
+        torch.cuda.set_device(gpu_ids[0])
+        for gpu_id in gpu_ids:
+            torch.cuda.reset_peak_memory_stats(gpu_id)
+        # Each worker has its own reader pool; avoid OpenCV oversubscription.
+        cv2.setNumThreads(1)
+        logging.info("[Worker %d, GPUs %s] Loading model for %d videos",
+                     rank, gpu_ids, len(videos))
+        scorer = PaliGemmaScorer(
+            model_path=args.paligemma_model_path,
+            lora_path=args.paligemma_lora_path,
+            device=f"cuda:{gpu_ids[0]}",
+            gpu_ids=gpu_ids,
+            image_size=args.paligemma_image_size,
+            streamforest_weights_path=args.paligemma_streamforest_weights,
+            vision_feature_layer=args.paligemma_vision_feature_layer,
+            attn_implementation=args.paligemma_attn,
+        )
+
+        grid_buffer = []
+        provenance = []
+
+        def flush_buffer():
+            if not grid_buffer:
+                return
+            scores = scorer.batch_score_grids(
+                grid_buffer, pg_prompt, batch_size=args.batch_size)
+            completed = {}
+            for vpath, metadata, start, count in provenance:
+                completed[vpath] = {
+                    "pg_scores": scores[start:start + count],
+                    "n_frames": metadata["n_frames"],
+                    "sample_interval": metadata["sample_interval"],
+                    "num_queries": count,
+                }
+            result_queue.put(("results", rank, completed))
+            grid_buffer.clear()
+            provenance.clear()
+
+        def read_one(vpath):
+            full_path = os.path.join(args.data_root, vpath)
+            if not os.path.exists(full_path):
+                return vpath, None, None, "file not found"
+            try:
+                grids, metadata = read_video_grids(
+                    full_path, args.paligemma_image_size,
+                    args.target_fps, args.query_interval, stop_event)
+                error = "could not read video" if not grids else None
+                return vpath, grids, metadata, error
+            except Exception as exc:
+                return vpath, None, None, str(exc)
+
+        # Bounded CPU prefetch overlaps decoding with GPU scoring, across videos.
+        with ThreadPoolExecutor(max_workers=args.num_readers) as pool:
+            video_iter = iter(videos)
+            pending = set()
+            exhausted = False
+            while not stop_event.is_set():
+                while not exhausted and len(pending) < args.num_readers * 3:
+                    vpath = next(video_iter, None)
+                    if vpath is None:
+                        exhausted = True
+                        break
+                    pending.add(pool.submit(read_one, vpath))
+                if not pending:
+                    break
+                done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                for future in done:
+                    if stop_event.is_set():
+                        break
+                    vpath, grids, metadata, error = future.result()
+                    if error:
+                        result_queue.put(("failed", rank, (vpath, error)))
+                        continue
+                    start = len(grid_buffer)
+                    grid_buffer.extend(grids)
+                    provenance.append((vpath, metadata, start, len(grids)))
+                    if len(grid_buffer) >= args.batch_size:
+                        flush_buffer()
+                if exhausted and not pending:
+                    break
+            for future in pending:
+                future.cancel()
+        # Finish the accumulated videos before acknowledging a graceful stop.
+        flush_buffer()
+        for gpu_id in gpu_ids:
+            logging.info("[Worker %d] GPU %d peak allocated=%.2f GiB, reserved=%.2f GiB",
+                         rank, gpu_id,
+                         torch.cuda.max_memory_allocated(gpu_id) / 2**30,
+                         torch.cuda.max_memory_reserved(gpu_id) / 2**30)
+    except BaseException:
+        stop_event.set()
+        result_queue.put(("error", rank, traceback.format_exc()))
+        raise
+    finally:
+        result_queue.put(("done", rank, None))
+
+
+def run_gpu_workers(videos, args, pg_prompt, results):
+    """Merge worker results centrally so --resume keeps its existing JSON format."""
+    context = mp.get_context("spawn")
+    stop_event = context.Event()
+    result_queue = context.Queue(maxsize=128)
+    workers = []
+    done_workers = set()
+    failed = []
+    errors = []
+    processed_count = 0
+    next_save = 500
+    start_time = time.time()
+    previous_handlers = {}
+
+    def handle_shutdown(signum, frame):
+        logging.warning("Received signal %d; saving after in-flight batches finish", signum)
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGUSR1, signal.SIGINT):
+        previous_handlers[sig] = signal.signal(sig, handle_shutdown)
+
+    pbar = tqdm(total=len(videos), desc="Processing videos (all GPUs)")
+    try:
+        # Disjoint shards ensure that no video is scored by two GPU groups.
+        num_workers = args.num_gpus // args.gpus_per_worker
+        for rank in range(min(num_workers, len(videos))):
+            worker = context.Process(
+                target=score_video_shard,
+                args=(rank, videos[rank::num_workers], args, pg_prompt,
+                      result_queue, stop_event),
+                name=f"pg-worker-{rank}",
+            )
+            worker.start()
+            workers.append(worker)
+
+        while len(done_workers) < len(workers):
+            try:
+                kind, rank, payload = result_queue.get(timeout=1)
+            except queue.Empty:
+                # Detect crashes such as OOM kills that cannot send an error message.
+                for rank, worker in enumerate(workers):
+                    if rank not in done_workers and worker.exitcode is not None:
+                        errors.append(f"Worker {rank} exited without completion (exit {worker.exitcode})")
+                        done_workers.add(rank)
+                        stop_event.set()
+                continue
+
+            if kind == "results":
+                results.update(payload)
+                count = len(payload)
+            elif kind == "failed":
+                failed.append(payload)
+                logging.warning("[Worker %d] %s: %s", rank, *payload)
+                count = 1
+            elif kind == "error":
+                errors.append(f"Worker {rank}:\n{payload}")
+                logging.error("Worker %d failed:\n%s", rank, payload)
+                stop_event.set()
+                continue
+            elif kind == "done":
+                done_workers.add(rank)
+                continue
+            else:
+                raise RuntimeError(f"Unknown GPU worker message: {kind}")
+
+            processed_count += count
+            pbar.update(count)
+            if processed_count >= next_save:
+                save_json_atomic(args.output_path, results)
+                next_save = (processed_count // 500 + 1) * 500
+                elapsed = time.time() - start_time
+                rate = processed_count / max(elapsed, 1e-6)
+                logging.info(
+                    "Progress: %d/%d (%.1f min elapsed, ~%.1f min remaining)",
+                    processed_count, len(videos), elapsed / 60,
+                    (len(videos) - processed_count) / rate / 60)
+    finally:
+        stop_event.set()
+        pbar.close()
+        # Drain results during shutdown, including a partially started worker pool.
+        while True:
+            try:
+                kind, rank, payload = result_queue.get(timeout=1)
+            except queue.Empty:
+                if not any(worker.is_alive() for worker in workers):
+                    break
+                continue
+            if kind == "results":
+                results.update(payload)
+                processed_count += len(payload)
+            elif kind == "failed":
+                failed.append(payload)
+                processed_count += 1
+            elif kind == "error":
+                errors.append(f"Worker {rank}:\n{payload}")
+        for rank, worker in enumerate(workers):
+            worker.join()
+            if worker.exitcode:
+                errors.append(f"Worker {rank} exited with code {worker.exitcode}")
+        result_queue.close()
+        result_queue.join_thread()
+        save_json_atomic(args.output_path, results)
+        output_path = Path(args.output_path)
+        failed_path = output_path.with_name(output_path.stem + "_failed.json")
+        if failed:
+            save_json_atomic(failed_path, failed)
+        elif failed_path.exists():
+            failed_path.unlink()
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+
+    logging.info(
+        "Pre-computation %s: %d total saved, %d/%d attempted this run, %d failed, %.1f min. Output: %s",
+        "interrupted" if processed_count < len(videos) else "complete",
+        len(results), processed_count, len(videos), len(failed),
+        (time.time() - start_time) / 60, args.output_path)
+    if failed:
+        logging.info("Failed list: %s", failed_path)
+    if errors:
+        raise RuntimeError("GPU pre-computation failed; completed scores were saved.\n" + "\n".join(errors))
 
 
 def main():
@@ -371,7 +659,14 @@ def main():
     # Pipeline configuration (must match eval exactly)
     parser.add_argument("--target-fps", type=int, default=4)
     parser.add_argument("--query-interval", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Inference batch size per model replica / GPU group (default: 32)")
+    parser.add_argument("--num-gpus", type=int, default=4,
+                        help="Number of visible CUDA GPUs to use (default: 4)")
+    parser.add_argument("--gpus-per-worker", type=int, choices=(1, 2), default=2,
+                        help="GPUs per model replica; 4 GPUs / 2 gives groups (0,1), (2,3)")
+    parser.add_argument("--num-readers", type=int, default=4,
+                        help="CPU video reader threads per GPU group (default: 4)")
 
     # Output
     parser.add_argument("--output-path", type=str,
@@ -385,6 +680,13 @@ def main():
 
     args = parser.parse_args()
 
+    for name in ("num_gpus", "num_readers", "batch_size", "query_interval"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.target_fps <= 0:
+        parser.error("--target-fps must be positive")
+    if args.num_gpus % args.gpus_per_worker:
+        parser.error("--num-gpus must be divisible by --gpus-per-worker")
     if not args.anno_path:
         parser.error(
             "--anno-path is required; set HIVAU_TRAIN_JSON in paths.local.sh "
@@ -393,7 +695,7 @@ def main():
         parser.error(f"HIVAU training annotation not found: {args.anno_path}")
 
     # Setup
-    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+    Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
 
     # Add project root to path for get_prompt import
     sys.path.insert(0, default_project_root)
@@ -422,179 +724,20 @@ def main():
         unique_videos = [v for v in unique_videos if v not in existing_results]
         logging.info(f"Remaining: {len(unique_videos)} videos to process")
 
-    # Load PG model
-    logging.info("Loading PaliGemma model...")
-    scorer = PaliGemmaScorer(
-        model_path=args.paligemma_model_path,
-        lora_path=args.paligemma_lora_path,
-        device="cuda:0",
-        image_size=args.paligemma_image_size,
-        streamforest_weights_path=args.paligemma_streamforest_weights,
-        vision_feature_layer=args.paligemma_vision_feature_layer,
-        attn_implementation=args.paligemma_attn,
-    )
+    if not unique_videos:
+        logging.info("No videos remain; skipping GPU initialization")
+        return
 
-    # ---- Cross-video batching with parallel readers ----
-    # Multiple threads read videos on CPU while GPU scores accumulated grids
-    # from multiple videos in full batches, maximizing GPU utilization.
-    NUM_READERS = 4        # Parallel CPU video reader threads
-    QUEUE_MAXSIZE = 24     # Max videos buffered in read queue
-
-    results = dict(existing_results)
-    failed = []
-    start_time = time.time()
-
-    # --- Graceful shutdown on SIGTERM (sent by SLURM before kill) ---
-    shutdown_requested = False
-
-    def handle_sigterm(signum, frame):
-        nonlocal shutdown_requested
-        shutdown_requested = True
-        logging.warning(f"Received signal {signum} — will save and exit after current batch.")
-
-    signal.signal(signal.SIGTERM, handle_sigterm)
-    signal.signal(signal.SIGUSR1, handle_sigterm)
-    signal.signal(signal.SIGINT, handle_sigterm)
-
-    read_q = queue.Queue(maxsize=QUEUE_MAXSIZE)
-
-    def _read_one(video_rel_path):
-        """Read a single video's frames and create grids (runs in thread pool)."""
-        full_path = os.path.join(args.data_root, video_rel_path)
-        if not os.path.exists(full_path):
-            return (video_rel_path, None, None, "file not found")
-        try:
-            grids, meta = read_video_grids(
-                full_path, args.paligemma_image_size,
-                args.target_fps, args.query_interval)
-            if grids is None:
-                return (video_rel_path, None, None, "could not read video")
-            return (video_rel_path, grids, meta, None)
-        except Exception as e:
-            return (video_rel_path, None, None, str(e))
-
-    def reader_dispatcher():
-        """Dispatch parallel video reads via thread pool and enqueue results."""
-        try:
-            with ThreadPoolExecutor(max_workers=NUM_READERS) as pool:
-                pending_futures = set()
-                vid_idx = 0
-                max_inflight = NUM_READERS * 3
-
-                while (vid_idx < len(unique_videos) or pending_futures) and not shutdown_requested:
-                    # Submit new reads up to the inflight limit
-                    while vid_idx < len(unique_videos) and len(pending_futures) < max_inflight:
-                        fut = pool.submit(_read_one, unique_videos[vid_idx])
-                        pending_futures.add(fut)
-                        vid_idx += 1
-
-                    if not pending_futures:
-                        break
-
-                    done, pending_futures = wait(pending_futures, return_when=FIRST_COMPLETED)
-                    for f in done:
-                        try:
-                            read_q.put(f.result())
-                        except Exception as e:
-                            read_q.put(("unknown", None, None, str(e)))
-        except Exception as e:
-            logging.error(f"Reader dispatcher error: {e}")
-        finally:
-            read_q.put(None)  # Sentinel to signal completion
-
-    dispatcher = threading.Thread(target=reader_dispatcher, daemon=True)
-    dispatcher.start()
-
-    # ---- GPU consumer: accumulate grids across videos, batch score ----
-    grid_buffer = []          # Flat list of grid images from multiple videos
-    buffer_provenance = []    # [(video_rel_path, metadata, start_idx, count), ...]
-    processed_count = 0
-    pbar = tqdm(total=len(unique_videos), desc="Processing videos")
-
-    def flush_buffer():
-        """Score all accumulated grids on GPU and distribute results."""
-        nonlocal grid_buffer, buffer_provenance
-        if not grid_buffer:
-            return
-        all_scores = scorer.batch_score_grids(
-            grid_buffer, pg_prompt, batch_size=args.batch_size)
-        for vpath, vmeta, vstart, vcount in buffer_provenance:
-            results[vpath] = {
-                "pg_scores": all_scores[vstart:vstart + vcount],
-                "n_frames": vmeta["n_frames"],
-                "sample_interval": vmeta["sample_interval"],
-                "num_queries": vcount,
-            }
-        grid_buffer = []
-        buffer_provenance = []
-
-    while True:
-        try:
-            item = read_q.get(timeout=2.0)
-        except queue.Empty:
-            if shutdown_requested:
-                break
-            continue
-
-        if item is None:
-            break
-
-        video_rel_path, grids, meta, error = item
-        processed_count += 1
-        pbar.update(1)
-
-        if error or grids is None:
-            failed.append((video_rel_path, error or "read failed"))
-            continue
-
-        # Accumulate grids from this video into the cross-video buffer
-        start_idx = len(grid_buffer)
-        grid_buffer.extend(grids)
-        buffer_provenance.append((video_rel_path, meta, start_idx, len(grids)))
-        del grids
-
-        # Flush to GPU when enough grids accumulated for efficient batching
-        if len(grid_buffer) >= args.batch_size:
-            flush_buffer()
-
-        # Periodic save (every 500 videos)
-        if processed_count % 500 == 0:
-            flush_buffer()
-            with open(args.output_path, 'w') as f:
-                json.dump(results, f)
-            elapsed = time.time() - start_time
-            rate = processed_count / elapsed
-            eta = (len(unique_videos) - processed_count) / rate
-            logging.info(
-                f"Progress: {processed_count}/{len(unique_videos)} "
-                f"({elapsed/60:.1f}min elapsed, ~{eta/60:.1f}min remaining)")
-
-        if shutdown_requested:
-            logging.warning(f"Graceful shutdown after {processed_count} videos.")
-            break
-
-    # Score any remaining buffered grids
-    flush_buffer()
-    pbar.close()
-    dispatcher.join(timeout=10)
-
-    # Final save
-    with open(args.output_path, 'w') as f:
-        json.dump(results, f)
-
-    elapsed = time.time() - start_time
-    logging.info(f"\n{'='*60}")
-    logging.info(f"Pre-computation complete!")
-    logging.info(f"  Processed: {len(results)} videos")
-    logging.info(f"  Failed: {len(failed)} videos")
-    logging.info(f"  Time: {elapsed/60:.1f} minutes")
-    logging.info(f"  Output: {args.output_path}")
-
-    if failed:
-        failed_path = args.output_path.replace('.json', '_failed.json')
-        with open(failed_path, 'w') as f:
-            json.dump(failed, f, indent=2)
-        logging.info(f"  Failed list: {failed_path}")
+    visible_gpus = torch.cuda.device_count()
+    if visible_gpus < args.num_gpus:
+        parser.error(
+            f"Requested {args.num_gpus} GPUs, but only {visible_gpus} CUDA GPUs are visible. "
+            "Set CUDA_VISIBLE_DEVICES or lower --num-gpus.")
+    logging.info(
+        "Using %d GPUs in %d groups of %d, batch size %d per group, %d reader threads per group",
+        args.num_gpus, args.num_gpus // args.gpus_per_worker, args.gpus_per_worker,
+        args.batch_size, args.num_readers)
+    run_gpu_workers(unique_videos, args, pg_prompt, existing_results)
 
 
 if __name__ == "__main__":
