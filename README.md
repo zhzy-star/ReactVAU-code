@@ -283,6 +283,8 @@ OUTPUT_DIR="${CKPT_ROOT}/hivau-finetune/reactvau-hivau" \
 
 The default Stage-2 configuration uses the downloaded StreamForest backbone, 4-bit QLoRA, DeepSpeed ZeRO-1, `tome729_fstw_pemf`, dynamic 1 FPS memory sampling, `short_online_v2` time messages, and the precomputed Fast scores. The output directory contains `adapter_config.json`, `adapter_model.*`, `non_lora_trainables.bin`, and the run configuration.
 
+The training launcher defaults to four GPUs on one node (`CUDA_VISIBLE_DEVICES=0,1,2,3`, `NPROC_PER_NODE=4`) using `torch.distributed.run`. Each GPU loads a model replica and trains on a different portion of the data. With `BATCH_SIZE=1` per GPU and `GRAD_ACCUM=2`, the effective batch size is 8, compared with 2 for the previous single-GPU defaults. These settings can be overridden through environment variables. For single-GPU training, set `CUDA_VISIBLE_DEVICES=0 NPROC_PER_NODE=1` before the command. The launcher checks that enough CUDA GPUs are visible before starting training.
+
 After Stage 2 completes, add the generated output to `paths.local.sh`:
 
 ```bash

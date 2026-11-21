@@ -381,8 +381,12 @@ def preprocess_multimodal(sources: Sequence[str], data_args: DataArguments, msg=
     if not is_multimodal:
         return sources
 
+    sources = copy.deepcopy(sources)
     for source in sources:
         for sentence in source:
+            # HIVAU annotations use <video>; the model inserts visual features
+            # at the shared <image> placeholder for both images and videos.
+            sentence["value"] = sentence["value"].replace("<video>", DEFAULT_IMAGE_TOKEN)
             # TODO maybe this should be changed for interleaved data?
             # if DEFAULT_IMAGE_TOKEN in sentence["value"] and not sentence["value"].startswith(DEFAULT_IMAGE_TOKEN):
             # only check for num_im=1
@@ -674,27 +678,27 @@ class LazySupervisedDataset(Dataset):
                     if media_type not in ['text', 'mix'] and video_read_type != 'fake':
                         ok = False
                         for i in range(3):
-                            data_path = cur_data_dict[i][media_type]
-                            if type(data_path) is list:
-                                data_path = data_path[0]
+                            sample_path = cur_data_dict[i][media_type]
+                            if type(sample_path) is list:
+                                sample_path = sample_path[0]
 
-                            rank0_print(f"Checking: {data_path}")
-                            if 's3://' in data_path:
+                            rank0_print(f"Checking: {sample_path}")
+                            if 's3://' in sample_path:
                                 if media_type == 'video' and video_read_type in ['img', 'frame']:
-                                    for path in self.client.list(data_path):
+                                    for path in self.client.list(sample_path):
                                         ok = True
                                         break
                                 else:
-                                    tmp_data = self.client.get(data_path)
+                                    tmp_data = self.client.get(sample_path)
                                     if tmp_data is not None and len(tmp_data) > 0:
                                         ok = True
                             else:
-                                if os.path.exists(data_path):
+                                if os.path.exists(sample_path):
                                     ok = True
                             if ok:
                                 break
 
-                        assert ok, f"Data in {data_path} can't be read!"
+                        assert ok, f"Data in {sample_path} can't be read!"
                     rank0_print(f"Loaded {len(cur_data_dict)} samples from {json_path}, media_type={media_type}, video_read_type={video_read_type}, data_root={data_root}")
                     # except Exception as e:
                     #     rank0_print(f"Loaded {len(cur_data_dict)} samples from {json_path}, data_root={data_root}, something maybe wrong {e}!!!")

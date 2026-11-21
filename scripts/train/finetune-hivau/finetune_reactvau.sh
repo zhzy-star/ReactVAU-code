@@ -8,8 +8,8 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-# ReactVAU HIVAU finetuning on a single RTX 4090.
-# Local non-SLURM version of scripts/sbatch/train_reactvau_hivau_4090.sh.
+# ReactVAU HIVAU finetuning on a single node with four GPUs by default.
+# Set CUDA_VISIBLE_DEVICES=0 NPROC_PER_NODE=1 for single-GPU training.
 
 set -eo pipefail
 
@@ -32,16 +32,22 @@ export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
 export TOKENIZERS_PARALLELISM=false
 export CUDA_LAUNCH_BLOCKING=0
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3}"
 export BNB_CUDA_VERSION=121
 export BITSANDBYTES_NOWELCOME=1
 
-export RANK=0
-export LOCAL_RANK=0
-export WORLD_SIZE=1
-export LOCAL_WORLD_SIZE=1
-export MASTER_ADDR=localhost
-export MASTER_PORT=${MASTER_PORT:-29500}
+# torch.distributed.run assigns rank and world-size variables to each worker.
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+GRAD_ACCUM="${GRAD_ACCUM:-2}"
+if [[ ! "$NPROC_PER_NODE" =~ ^[1-9][0-9]*$ ||
+      ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ||
+      ! "$GRAD_ACCUM" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NPROC_PER_NODE, BATCH_SIZE, and GRAD_ACCUM must be positive integers"
+    exit 1
+fi
 
 # ==========================================
 # 2. Model, Data, and Output
@@ -62,7 +68,7 @@ MM_PROJECTOR_TYPE="${MM_PROJECTOR_TYPE:-tome729_fstw_pemf}"
 PROMPT_VERSION="${PROMPT_VERSION:-qwen_2}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
 MAX_STEPS="${MAX_STEPS:--1}"
-MID_RUN_NAME="${MID_RUN_NAME:-hivau_ft_4090_qlora_$(date +"%Y%m%d_%H%M%S")}"
+MID_RUN_NAME="${MID_RUN_NAME:-hivau_ft_${NPROC_PER_NODE}gpu_qlora_$(date +"%Y%m%d_%H%M%S")}"
 OUTPUT_DIR="${OUTPUT_DIR:-ckpt/hivau-finetune/${MID_RUN_NAME}}"
 mkdir -p "${OUTPUT_DIR}/runs"
 
@@ -83,15 +89,29 @@ EOF
 # 3. Pre-flight Checks
 # ==========================================
 echo "=========================================="
-echo "ReactVAU HIVAU Finetune (RTX 4090, 4-bit QLoRA)"
+echo "ReactVAU HIVAU Finetune (${NPROC_PER_NODE} GPUs, 4-bit QLoRA)"
 echo "=========================================="
 echo "Date: $(date)"
 echo "Project: $PROJECT_ROOT"
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
 echo "CUDA: $(nvcc --version 2>/dev/null | grep release || echo 'N/A')"
+echo "GPUs: ${NPROC_PER_NODE} (visible: ${CUDA_VISIBLE_DEVICES})"
+echo "Batch size per GPU: ${BATCH_SIZE}"
+echo "Gradient accumulation: ${GRAD_ACCUM}"
+echo "Effective batch size: $((NPROC_PER_NODE * BATCH_SIZE * GRAD_ACCUM))"
 echo "Output: ${OUTPUT_DIR}"
 echo "Data YAML: ${DATA_VERSION}"
 echo ""
+
+python - "$NPROC_PER_NODE" <<'PY'
+import sys
+import torch
+
+requested = int(sys.argv[1])
+available = torch.cuda.device_count()
+if not torch.cuda.is_available() or available < requested:
+    raise SystemExit(f"ERROR: Requested {requested} GPUs, but only {available} CUDA GPUs are visible")
+PY
 
 if [ ! -d "$LLM_VERSION" ]; then
     echo "ERROR: LLM checkpoint not found: $LLM_VERSION"
@@ -119,7 +139,13 @@ echo ""
 # 4. Run Training
 # ==========================================
 set +e
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} python -u llava/train/train_mem.py \
+python -u -m torch.distributed.run \
+    --nnodes=1 \
+    --node_rank=0 \
+    --nproc_per_node="${NPROC_PER_NODE}" \
+    --master_addr="${MASTER_ADDR}" \
+    --master_port="${MASTER_PORT}" \
+    llava/train/train_mem.py \
     --deepspeed scripts/deepspeed/zero1.json \
     --model_name_or_path ${LLM_VERSION} \
     --version ${PROMPT_VERSION} \
@@ -149,9 +175,9 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} python -u llava/train/train_mem.py 
     --output_dir ${OUTPUT_DIR} \
     --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
     --max_steps "${MAX_STEPS}" \
-    --per_device_train_batch_size 1 \
+    --per_device_train_batch_size "${BATCH_SIZE}" \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps "${GRAD_ACCUM}" \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 500 \

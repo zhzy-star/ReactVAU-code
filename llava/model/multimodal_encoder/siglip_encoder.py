@@ -10,6 +10,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 import os
+import json
 from transformers.image_processing_utils import BatchFeature, get_size_dict
 from transformers.image_transforms import (
     convert_to_rgb,
@@ -547,7 +548,30 @@ class SigLipVisionTower(nn.Module):
 
         self.image_processor = SigLipImageProcessor()
 
-        if not delay_load:
+        # A full StreamForest checkpoint already contains the vision tower.
+        # Build its architecture here so the outer from_pretrained call can
+        # restore those weights without accessing the original machine's path.
+        checkpoint_index = os.path.join(
+            getattr(vision_tower_cfg, "_name_or_path", ""),
+            "model.safetensors.index.json",
+        )
+        checkpoint_keys = set()
+        if os.path.isfile(checkpoint_index):
+            with open(checkpoint_index) as index_file:
+                checkpoint_keys = set(json.load(index_file)["weight_map"])
+        prefix = "model.vision_tower.vision_tower."
+        if any(key.startswith(prefix) for key in checkpoint_keys):
+            self.vision_tower = SigLipVisionModel(self.config)
+            del self.vision_tower.vision_model.encoder.layers[-1:]
+            self.vision_tower.vision_model.head = nn.Identity()
+            required_keys = {prefix + key for key in self.vision_tower.state_dict()}
+            missing_keys = required_keys - checkpoint_keys
+            if missing_keys:
+                raise ValueError(f"Incomplete vision tower in checkpoint: {sorted(missing_keys)}")
+            self.vision_tower.requires_grad_(False)
+            self.is_loaded = True
+            rank0_print("Restoring vision tower from the full model checkpoint")
+        elif not delay_load:
             rank0_print(f"Loading vision tower: {vision_tower}")
             self.load_model()
         elif getattr(vision_tower_cfg, "unfreeze_mm_vision_tower", False):
