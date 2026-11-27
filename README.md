@@ -338,7 +338,13 @@ Each run saves `detection.log`, `summary.json`, and `video_results.json` under a
 
 ### Full ReactVAU streaming VAD
 
-The full pipeline performs Fast scoring and AAPM updates continuously and invokes the Slow module only after the trigger threshold is crossed. Run UCF-Crime with the supplied paper configuration:
+The full pipeline performs Fast scoring and AAPM updates continuously and invokes the Slow module only after the trigger threshold is crossed. By default, the launcher uses four GPUs (`CUDA_VISIBLE_DEVICES=0,1,2,3`, `NPROC_PER_NODE=4`). Each GPU loads a complete PaliGemma + StreamForest pipeline and processes a disjoint set of videos, preserving each video's memory and smoothing state. Rank 0 merges all frame predictions before computing global metrics; metrics are not averaged across GPUs. `PALIGEMMA_BATCH_SIZE` is per GPU and defaults to 1 for 24 GB cards. For one GPU, set `CUDA_VISIBLE_DEVICES=0 NPROC_PER_NODE=1`.
+
+Use `DETERMINISTIC=true` for reproducible single-/multi-GPU comparisons. This selects deterministic CUDA operations, including the memory token-merging reductions, and may affect runtime; it is disabled by default.
+
+Set `STREAMFOREST_MODEL_PATH` (or `REACTVAU_CHECKPOINT_PATH`) to the evaluation-compatible Stage-2 checkpoint. A BF16 evaluation checkpoint must contain the trained LoRA and projector, without packed 4-bit frozen base parameters in `non_lora_trainables.bin`.
+
+Run UCF-Crime with the supplied paper configuration:
 
 ```bash
 DATASET=ucf-crime TEST_MODE=true TEST_SAMPLES=5 \
@@ -348,17 +354,17 @@ DATASET=ucf-crime TEST_MODE=false \
   bash scripts/eval/run_eval_reactvau_detect.sh
 ```
 
-The maintained script sets the UCF-Crime recall-90 trigger threshold to `0.3486`. For the XD-Violence protocol, change the `ANOMALY_THRESHOLD` selection in `scripts/eval/run_eval_reactvau_detect.sh` to the already documented XD-Violence value `0.4073`, then run:
+The maintained script defaults to the UCF-Crime recall-90 trigger threshold `0.3486`. For the XD-Violence protocol, set `ANOMALY_THRESHOLD=0.4073`:
 
 ```bash
-DATASET=xd-violence TEST_MODE=true TEST_SAMPLES=5 \
+DATASET=xd-violence ANOMALY_THRESHOLD=0.4073 TEST_MODE=true TEST_SAMPLES=5 \
   bash scripts/eval/run_eval_reactvau_detect.sh
 
-DATASET=xd-violence TEST_MODE=false \
+DATASET=xd-violence ANOMALY_THRESHOLD=0.4073 TEST_MODE=false \
   bash scripts/eval/run_eval_reactvau_detect.sh
 ```
 
-Keep the remaining paper settings unchanged: weighted score fusion with `FUSION_ALPHA=0.40`, Anomaly Pool threshold `0.6`, APS memory enhancement, RT-Anomaly dense encoding, and causal online smoothing. Outputs are written to a timestamped `reactvau-<dataset>-...` directory under `eval_results/vad/` and contain `detection.log`, `summary.json`, and `video_results.json`.
+Keep the remaining paper settings unchanged: weighted score fusion with `FUSION_ALPHA=0.40`, Anomaly Pool threshold `0.6`, APS memory enhancement, RT-Anomaly dense encoding, and causal online smoothing. Outputs are written to a timestamped `reactvau-<dataset>-...` directory under `eval_results/vad/` and contain `detection.log`, `summary.json`, and `video_results.json`. Multi-GPU runs also save `detection_rank<N>.log`; the summary records `world_size`, per-rank video assignments, failures, and timing. Temporary prediction shards are removed after results are saved.
 
 ### HIVAU-70K anomaly-understanding evaluation
 

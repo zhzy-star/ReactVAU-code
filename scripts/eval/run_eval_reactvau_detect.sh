@@ -8,8 +8,9 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-# ReactVAU Video Anomaly Detection Evaluation Script (Single GPU)
+# ReactVAU Video Anomaly Detection Evaluation (four GPUs by default)
 # Combined PaliGemma + StreamForest Pipeline
+# Each GPU processes disjoint videos; rank 0 computes global frame metrics.
 
 set -e
 
@@ -38,7 +39,16 @@ export PYTHONUNBUFFERED=1
 exec 2>&1
 
 # Set CUDA device
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+DETERMINISTIC="${DETERMINISTIC:-false}"
+if [ "$DETERMINISTIC" = true ]; then
+    export CUBLAS_WORKSPACE_CONFIG=:4096:8
+    DETERMINISTIC_FLAGS=(--deterministic)
+else
+    DETERMINISTIC_FLAGS=()
+fi
 
 # ==========================================
 # 2. Path Configuration
@@ -85,8 +95,23 @@ TARGET_FPS=4            # 4 FPS sampling
 QUERY_INTERVAL=4        # 4 frames per query = 1 query per second
 
 # PaliGemma settings
-PALIGEMMA_BATCH_SIZE=1  # Minimum for single 24GB GPU with both models loaded
+PALIGEMMA_BATCH_SIZE="${PALIGEMMA_BATCH_SIZE:-1}"  # Per GPU, with both models loaded
 PALIGEMMA_ATTN="sdpa"
+
+if [[ ! "$NPROC_PER_NODE" =~ ^[1-9][0-9]*$ ||
+      ! "$PALIGEMMA_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NPROC_PER_NODE and PALIGEMMA_BATCH_SIZE must be positive integers"
+    exit 1
+fi
+python - "$NPROC_PER_NODE" <<'PY'
+import sys
+import torch
+
+requested = int(sys.argv[1])
+available = torch.cuda.device_count()
+if not torch.cuda.is_available() or available < requested:
+    raise SystemExit(f"ERROR: Requested {requested} GPUs, but only {available} CUDA GPUs are visible")
+PY
 
 # StreamForest settings  
 STREAMFOREST_CONV_TEMPLATE="qwen_2"
@@ -100,7 +125,7 @@ TRIGGER_MODE="score"
 
 # Anomaly threshold for triggering StreamForest
 # When PaliGemma score >= threshold, StreamForest is activated
-ANOMALY_THRESHOLD=0.3486     # UCF-Crime training recall90
+ANOMALY_THRESHOLD="${ANOMALY_THRESHOLD:-0.3486}"     # UCF-Crime training recall90
 # ANOMALY_THRESHOLD=0.4073     # XD-Violence training recall90
 
 # Score fusion configuration
@@ -131,7 +156,7 @@ TEST_SAMPLES="${TEST_SAMPLES:-5}"  # Override with TEST_SAMPLES=1 for a quick 24
 # ==========================================
 # 6. Run Evaluation
 # ==========================================
-cd $PROJECT_ROOT
+cd "$PROJECT_ROOT"
 
 # Create necessary directories
 mkdir -p "$OUTPUT_PATH"
@@ -148,7 +173,7 @@ if [ "$PALIGEMMA_IMAGE_SIZE" -eq 384 ]; then
 fi
 
 echo "=========================================="
-echo "ReactVAU VAD Evaluation (Single GPU)"
+echo "ReactVAU VAD Evaluation (${NPROC_PER_NODE} GPUs)"
 echo "=========================================="
 echo "Start Time: $(date)"
 echo ""
@@ -206,7 +231,9 @@ echo "  Anomaly Threshold: $ANOMALY_THRESHOLD"
 echo "  Pool Threshold: $POOL_THRESHOLD"
 echo "  Score Fusion: $SCORE_FUSION"
 echo "  SF Scoring Method: $SF_SCORING_METHOD"
-echo "  PaliGemma Batch Size: $PALIGEMMA_BATCH_SIZE"
+echo "  GPUs: $NPROC_PER_NODE (visible: $CUDA_VISIBLE_DEVICES)"
+echo "  Deterministic execution: $DETERMINISTIC"
+echo "  PaliGemma Batch Size per GPU: $PALIGEMMA_BATCH_SIZE"
 echo "  Online Smoothing: alpha=$ONLINE_SMOOTH_ALPHA, beta=$ONLINE_SMOOTH_BETA"
 echo ""
 echo "Output: $OUTPUT_PATH"
@@ -223,7 +250,11 @@ fi
 echo ""
 
 # Run evaluation
-python ${PROJECT_ROOT}/eval_utils/vad/eval_reactvau_detection.py \
+LAUNCHER=(python)
+if [ "$NPROC_PER_NODE" -gt 1 ]; then
+    LAUNCHER+=(-m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE")
+fi
+"${LAUNCHER[@]}" "${PROJECT_ROOT}/eval_utils/vad/eval_reactvau_detection.py" \
     --paligemma-model-path "$PALIGEMMA_MODEL_PATH" \
     $PG_LORA_FLAG \
     $PG_VISION_FLAGS \
@@ -252,6 +283,7 @@ python ${PROJECT_ROOT}/eval_utils/vad/eval_reactvau_detection.py \
     $MEMORY_FLAG \
     $RT_ANOMALY_FLAG \
     --save-video-scores \
+    "${DETERMINISTIC_FLAGS[@]}" \
     $TEST_FLAGS
 
 echo ""

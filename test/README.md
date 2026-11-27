@@ -87,3 +87,23 @@ Use its final adapter directory for reload checks only; it is not a trained
 benchmark model. Full training outputs include the same adapter/processor files
 expected by downstream code; point `PALIGEMMA_LORA_PATH` at the generated run
 directory when intentionally using a completed full run.
+
+## ReactVAU four-GPU evaluation smoke test
+
+Set `PALIGEMMA_LORA_PATH` to the trained Fast adapter and `STREAMFOREST_MODEL_PATH`
+to the evaluation-compatible Slow adapter/projector directory, then run in the
+ReactVAU environment:
+
+```bash
+python test/smoke_eval_reactvau_multigpu.py
+```
+
+This runs the real models on five short generated videos with four GPUs and one
+GPU, then tests two videos across four ranks. It forces Slow triggers only for
+the smoke runs and enables deterministic CUDA operations to avoid existing
+token-merge reduction variability. It verifies device assignments and disjoint video coverage, compares
+query scores and all four metric groups, and checks empty ranks and temporary
+shard cleanup. A separate fixture checks that global AUC is computed from merged
+predictions and rejects duplicate videos and mismatched frame arrays. Artifacts,
+rank logs, and `smoke_report.json` are under `test/artifacts/reactvau_eval/`.
+These checks validate execution and aggregation, not model quality or speedup.

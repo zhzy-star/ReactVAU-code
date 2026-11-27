@@ -1,0 +1,86 @@
+{
+  "scope": "Observed experiment from first Stage-1 log to final successful full UCF-Crime evaluation. Calendar time includes idle gaps, debugging, retries and intermediate evaluations.",
+  "start": "2026-11-15T23:11:56.003000",
+  "end": "2026-11-22T14:12:55.517000",
+  "calendar_elapsed_seconds": 572459.514,
+  "calendar_elapsed_hours": 159.01653166666665,
+  "amortized_final_eval_output_fps_over_calendar_time": {
+    "original_frames": 1.9421600529116196,
+    "sampled_frames": 0.2776737849796658,
+    "definition": "Final successful evaluation frame count divided by calendar duration of the entire experiment. This is not inference FPS or total processing throughput."
+  },
+  "stages": {
+    "stage1": {
+      "source": "/root/autodl-tmp/ReactVAU-code/test/artifacts/training/training_20261115_231154_534658/training.log",
+      "observed_seconds_to_last_log": 27471.14,
+      "optimizer_steps": 7370,
+      "global_batch": 32,
+      "training_sample_presentations": 235840,
+      "periodic_validations": 29,
+      "validation_samples_per_pass": 12701,
+      "validation_runtime_seconds": 10351.080200000002,
+      "status": "Reached 7370 steps; best-checkpoint reload failed (checkpoint-3750 missing). No successful final metrics summary. Downstream used checkpoint-6500."
+    },
+    "precompute": {
+      "source": "/root/autodl-tmp/ReactVAU-code/precomputed/pg_scores_hivau_train_ckpt6500.json",
+      "videos": 72325,
+      "queries": 2079326,
+      "original_frames": 51077274,
+      "sampled_frames": 8198586,
+      "elapsed_seconds": null,
+      "reason": "No corresponding complete production timing log found. Smoke-test timings were excluded."
+    },
+    "stage2": {
+      "source": "/root/autodl-tmp/ReactVAU-code/ckpt/hivau-finetune/reactvau-hivau/trainer_state.json",
+      "train_runtime_seconds": 72295.532,
+      "optimizer_steps": 12144,
+      "num_input_tokens_seen": 0,
+      "note": "Token counter is disabled/unrecorded; zero does not mean zero consumption. train_runtime excludes some model/data initialization and final save."
+    },
+    "eval": {
+      "source": "/root/autodl-tmp/ReactVAU-code/eval_results/vad/reactvau-ucf-crime-score-weighted-thresh0.3486-2026-11-22-11-31-09-893592/summary.json",
+      "videos": 290,
+      "failed_videos": 0,
+      "world_size": 4,
+      "logged_processing_seconds": 9677.882445335388,
+      "seconds_including_initialization_and_metrics": 9705.616,
+      "original_frames": 1111808,
+      "sampled_frames": 158957,
+      "processing_original_fps": 114.88132928664336,
+      "processing_sampled_fps": 16.42477069729393,
+      "paligemma_queries": 39854,
+      "streamforest_triggers": 11134
+    }
+  },
+  "known_stage_duration_sum_seconds": 109472.288,
+  "known_stage_duration_sum_is_complete": false,
+  "token_accounting": {
+    "unit": "Logical model sequence positions, including visual and text tokens; each sample/query counted once per pass. Not API billing tokens and not FLOPs.",
+    "paligemma_training_tokens_per_sample": 762,
+    "paligemma_prefix_tokens_per_query": 760,
+    "visual_tokens_per_grid": 729,
+    "reconstructed_effective_tokens": {
+      "stage1_training": 179710080,
+      "stage1_periodic_validation": 279930040,
+      "precompute": 1580287760,
+      "eval_paligemma": 30289040
+    },
+    "reconstructed_paligemma_subtotal": 2070216920,
+    "complete_pipeline_total": null,
+    "excluded": [
+      "Stage-2 text, labels and visual memory tokens",
+      "StreamForest eval dynamic prompts and visual memory tokens",
+      "DDP sampler padding and precompute tail-batch duplicate grids",
+      "Activation-checkpoint recomputation",
+      "Debug/smoke runs, earlier failed/partial evals and other retries"
+    ],
+    "caveat": "Reconstructed effective-work subtotal, not an exact total of physically executed token positions. Production precompute metadata lacks run configuration provenance."
+  },
+  "full_pipeline_processing_fps": null,
+  "missing_for_exact_active_pipeline_statistics": [
+    "Production precompute start/end or elapsed time, including resume segments",
+    "Stage-2 actual sampled-frame count and post-multimodal sequence lengths across all ranks/steps",
+    "StreamForest input sequence lengths per eval trigger",
+    "Consistent accounting for initialization, checkpoint saving, padding and failed/retried work"
+  ]
+}

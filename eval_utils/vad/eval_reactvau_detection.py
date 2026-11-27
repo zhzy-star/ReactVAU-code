@@ -53,10 +53,12 @@ import random
 import argparse
 import torch.nn.functional as F
 import torch
+import torch.distributed as dist
 import json
 import cv2
 import os
 import sys
+import shutil
 
 # Add ReactVAU path dynamically — MUST be before any imports that depend on it
 ReactVAU_ROOT = os.path.dirname(os.path.dirname(
@@ -261,7 +263,7 @@ class PaliGemmaDetector:
             logging.info(
                 f"[PaliGemma] Loading LoRA adapter from {lora_path}...")
             self.model = PeftModel.from_pretrained(
-                self.model, lora_path, torch_dtype=torch_dtype)
+                self.model, lora_path, torch_dtype=torch_dtype, torch_device="cpu")
             self.model = self.model.merge_and_unload()
             logging.info("[PaliGemma] LoRA adapter loaded and merged")
 
@@ -1318,6 +1320,41 @@ class CombinedAnomalyDetector:
 
 # ===================== Main =====================
 
+def merge_rank_results(shard_dir, world_size):
+    """Concatenate frame predictions; metrics must be computed globally."""
+    parts = {name: [] for name in ("scores", "labels", "smoothed", "online_smoothed")}
+    video_results, failed_videos = {}, {}
+    totals = dict(total_queries=0, total_segments=0, total_triggers=0)
+    timing = {"pg_infer_total": 0.0}
+    rank_stats = []
+    for rank in range(world_size):
+        with np.load(os.path.join(shard_dir, f"rank-{rank}.npz")) as shard:
+            arrays = {name: shard[name] for name in parts}
+        if any(a.ndim != 1 for a in arrays.values()) or len({len(a) for a in arrays.values()}) != 1:
+            raise ValueError(f"Mismatched frame arrays in rank {rank}")
+        if any(not np.isfinite(a).all() for a in arrays.values()):
+            raise ValueError(f"Nonfinite frame predictions in rank {rank}")
+        for name, value in arrays.items():
+            parts[name].append(value)
+        with open(os.path.join(shard_dir, f"rank-{rank}.json")) as f:
+            metadata = json.load(f)
+        overlap = video_results.keys() & metadata["video_results"].keys()
+        if overlap:
+            raise ValueError(f"Videos processed by multiple ranks: {sorted(overlap)}")
+        video_results.update(metadata["video_results"])
+        failed_videos.update(metadata["failed_videos"])
+        for name in totals:
+            totals[name] += metadata[name]
+        for name, value in metadata["timing"].items():
+            if name == "pg_infer_total":
+                timing[name] += value
+            else:
+                timing.setdefault(name, []).extend(value)
+        rank_stats.append(metadata["rank_stats"])
+    return ({name: np.concatenate(values) for name, values in parts.items()},
+            video_results, totals, timing, rank_stats, failed_videos)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Combined PaliGemma + StreamForest VAD Evaluation")
@@ -1407,16 +1444,38 @@ def main():
     parser.add_argument("--test-mode", action="store_true")
     parser.add_argument("--test-samples", type=int, default=5)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Use deterministic CUDA operations for reproducible memory compression")
 
     args = parser.parse_args()
+
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if not torch.cuda.is_available() or local_rank >= torch.cuda.device_count():
+        parser.error(f"Rank {rank} requires visible CUDA device {local_rank}; "
+                     f"found {torch.cuda.device_count()} visible GPU(s)")
+    torch.cuda.set_device(local_rank)
+    if args.deterministic:
+        # Must precede model loading / the first cuBLAS operation.
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        torch.use_deterministic_algorithms(True)
 
     # Validate 384 mode args
     if args.paligemma_image_size == 384 and not args.paligemma_streamforest_weights:
         parser.error(
             "--paligemma-streamforest-weights is required when --paligemma-image-size is 384")
 
-    # Create output directory
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    if world_size > 1:
+        # Only synchronize metadata; large frame arrays are merged through disk.
+        dist.init_process_group(backend="gloo", timeout=datetime.timedelta(hours=24))
+
+    # All ranks share one run directory, with a separate log for each rank.
+    run_timestamp = [datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
+                     if rank == 0 else None]
+    if world_size > 1:
+        dist.broadcast_object_list(run_timestamp, src=0)
+    now_str = run_timestamp[0]
     output_dir = os.path.join(
         args.output_path,
         f"reactvau-{args.dataset}-{args.trigger_mode}-{args.score_fusion}-thresh{args.anomaly_threshold}-{now_str}"
@@ -1428,7 +1487,8 @@ def main():
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(os.path.join(output_dir, "detection.log")),
+            logging.FileHandler(os.path.join(
+                output_dir, "detection.log" if rank == 0 else f"detection_rank{rank}.log")),
             logging.StreamHandler(),
         ]
     )
@@ -1437,6 +1497,8 @@ def main():
     logging.info("ReactVAU Evaluation")
     logging.info("=" * 70)
     logging.info(f"Output directory: {output_dir}")
+    logging.info(f"Rank: {rank}/{world_size}, CUDA device: {local_rank}")
+    logging.info(f"Deterministic execution: {args.deterministic}")
     logging.info(f"PaliGemma model: {args.paligemma_model_path}")
     logging.info(f"PaliGemma LoRA:  {args.paligemma_lora_path or 'None'}")
     logging.info(f"StreamForest model: {args.streamforest_model_path}")
@@ -1476,13 +1538,16 @@ def main():
     annotations = load_anno_txt(args.anno_path, args.dataset,
                                 video_dir=args.video_dir)
 
-    video_keys = list(annotations.keys())
+    video_keys = sorted(annotations.keys())
     if args.test_mode:
         random.seed(42)
         video_keys = random.sample(video_keys, min(
             args.test_samples, len(video_keys)))
         logging.info(f"Test mode: using {len(video_keys)} samples")
     logging.info(f"Total videos to process: {len(video_keys)}")
+    total_selected_videos = len(video_keys)
+    video_keys = video_keys[rank::world_size]
+    logging.info(f"Videos assigned to rank {rank}: {len(video_keys)}")
 
     # Initialize models. On 24GB GPUs, load StreamForest first so the transient
     # LoRA merge peak does not compete with PaliGemma already resident in VRAM.
@@ -1491,11 +1556,11 @@ def main():
         model_path=args.streamforest_model_path,
         model_base=args.streamforest_model_base,
         conv_template=args.streamforest_conv_template,
-        device="cuda:0",
+        device=f"cuda:{local_rank}",
         time_msg_style=args.streamforest_time_msg,
         load_4bit=(args.streamforest_quantization == "4bit"),
         load_8bit=(args.streamforest_quantization == "8bit"),
-    )
+    ) if video_keys else None
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         logging.info(
@@ -1506,12 +1571,12 @@ def main():
     paligemma = PaliGemmaDetector(
         model_path=args.paligemma_model_path,
         lora_path=args.paligemma_lora_path,
-        device="cuda:0",
+        device=f"cuda:{local_rank}",
         attn_implementation=args.paligemma_attn,
         image_size=args.paligemma_image_size,
         streamforest_weights_path=args.paligemma_streamforest_weights,
         vision_feature_layer=args.paligemma_vision_feature_layer,
-    )
+    ) if video_keys else None
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         logging.info(
@@ -1535,7 +1600,7 @@ def main():
         pool_threshold=args.pool_threshold,
         online_smooth_alpha=args.online_smooth_alpha,
         online_smooth_beta=args.online_smooth_beta,
-    )
+    ) if video_keys else None
 
     logging.info(f"Memory enhancement (Pool+APS): {'ENABLED' if args.enable_memory_enhancement else 'DISABLED'}")
     logging.info(f"RT-Anomaly dense encoding: {'ENABLED' if args.enable_rt_anomaly else 'DISABLED'}")
@@ -1556,6 +1621,7 @@ def main():
     all_smoothed_scores = []
     all_online_smoothed_scores = []
     video_results = {}
+    failed_videos = {}
 
     total_queries = 0
     total_segments = 0
@@ -1571,9 +1637,11 @@ def main():
         "sf_trigger_total_times": [],
     }
 
+    if world_size > 1:
+        dist.barrier()
     start_time = time.time()
 
-    pbar = tqdm(video_keys, desc="Processing videos", dynamic_ncols=True)
+    pbar = tqdm(video_keys, desc=f"Rank {rank}: Processing videos", dynamic_ncols=True)
     for video_key in pbar:
         pbar.set_postfix({"video": video_key[:30]}, refresh=True)
 
@@ -1585,6 +1653,7 @@ def main():
 
         if not os.path.exists(video_path):
             logging.warning(f"Video not found: {video_path}")
+            failed_videos[video_key] = f"Video not found: {video_path}"
             continue
 
         # Read native fps for GT label creation
@@ -1647,9 +1716,43 @@ def main():
 
         except Exception as e:
             logging.error(f"Error processing {video_key}: {e}")
+            failed_videos[video_key] = str(e)
             traceback.print_exc()
 
     elapsed_time = time.time() - start_time
+    rank_stats = [{"rank": rank, "local_rank": local_rank,
+                   "assigned_video_keys": video_keys,
+                   "num_videos": len(video_results),
+                   "num_failed_videos": len(failed_videos),
+                   "elapsed_time_sec": elapsed_time,
+                   "peak_gpu_memory_allocated_mb": torch.cuda.max_memory_allocated() / (1024 ** 2)}]
+
+    if world_size > 1:
+        shard_dir = os.path.join(output_dir, "_shards")
+        os.makedirs(shard_dir, exist_ok=True)
+        np.savez(os.path.join(shard_dir, f"rank-{rank}.npz"),
+                 scores=np.asarray(all_frame_scores, dtype=np.float64),
+                 labels=np.asarray(all_frame_labels, dtype=np.uint8),
+                 smoothed=np.asarray(all_smoothed_scores, dtype=np.float64),
+                 online_smoothed=np.asarray(all_online_smoothed_scores, dtype=np.float64))
+        with open(os.path.join(shard_dir, f"rank-{rank}.json"), "w") as f:
+            json.dump({"video_results": video_results, "failed_videos": failed_videos,
+                       "total_queries": total_queries, "total_segments": total_segments,
+                       "total_triggers": total_triggers, "timing": agg_timing,
+                       "rank_stats": rank_stats[0]}, f)
+        logging.info(f"Rank {rank} finished {len(video_results)} videos; waiting for other ranks")
+        del all_frame_scores, all_frame_labels, all_smoothed_scores, all_online_smoothed_scores, video_results
+        dist.barrier()
+        dist.destroy_process_group()
+        if rank != 0:
+            return
+        arrays, video_results, totals, agg_timing, rank_stats, failed_videos = merge_rank_results(shard_dir, world_size)
+        all_frame_scores, all_frame_labels = arrays["scores"], arrays["labels"]
+        all_smoothed_scores, all_online_smoothed_scores = arrays["smoothed"], arrays["online_smoothed"]
+        total_queries, total_segments, total_triggers = (totals[name] for name in
+                                                       ("total_queries", "total_segments", "total_triggers"))
+        elapsed_time = max(stat["elapsed_time_sec"] for stat in rank_stats)
+        logging.info(f"Merged predictions from all {world_size} GPUs")
 
     if not video_results:
         raise RuntimeError(
@@ -1792,6 +1895,12 @@ def main():
         "target_fps": args.target_fps,
         "query_interval": args.query_interval,
         "batch_size": args.batch_size,
+        "world_size": world_size,
+        "deterministic": args.deterministic,
+        "rank_stats": rank_stats,
+        "num_selected_videos": total_selected_videos,
+        "num_failed_videos": len(failed_videos),
+        "failed_videos": failed_videos,
         "num_videos": len(video_results),
         "total_queries": total_queries,
         "total_triggers": total_triggers,
@@ -1829,9 +1938,16 @@ def main():
         with open(os.path.join(output_dir, "video_results.json"), 'w') as f:
             json.dump(video_results, f, indent=2)
 
+    if world_size > 1:
+        shutil.rmtree(shard_dir)
+
     logging.info(f"\nResults saved to {output_dir}")
     logging.info("=" * 70)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()

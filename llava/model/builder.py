@@ -138,7 +138,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             from peft import PeftModel
 
             rank0_print("Loading LoRA weights...")
-            model = PeftModel.from_pretrained(model, model_path)
+            # Stage adapter tensors on CPU so concurrent ranks do not all use cuda:0.
+            model = PeftModel.from_pretrained(model, model_path, torch_device="cpu")
             rank0_print("Merging LoRA weights...")
             model = model.merge_and_unload()
             rank0_print("Model is loaded...")
